@@ -180,6 +180,7 @@ Return the requested structured validation result.
         request: VideoRequest,
         script: Script,
         duration: int,
+        correction_prompt: str | None = None,
     ) -> Storyboard:
         prompt = f"""
 Target duration: {duration} seconds.
@@ -239,6 +240,9 @@ Prefer one meaningful financial idea per scene.
 The concatenated narration across all storyboard scenes
 must cover the complete final script.
 """
+
+        if correction_prompt:
+            prompt += f"\n\nCORRECTION INSTRUCTIONS:\n{correction_prompt}"
 
         response = self.client.responses.parse(
             model=self.model,
