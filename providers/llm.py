@@ -16,7 +16,7 @@ class LLMProvider:
     def __init__(
         self,
         api_key: str,
-        model: str = "gpt-4o-mini-2024-07-18",
+        model: str = "gpt-5-mini-2025-08-07",
     ):
         self.client = OpenAI(api_key=api_key)
         self.model = model
