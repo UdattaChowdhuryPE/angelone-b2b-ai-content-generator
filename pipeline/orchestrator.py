@@ -7,16 +7,22 @@ from pipeline.models import (
 )
 from pipeline.validators import validate_storyboard
 from providers.llm import LLMProvider
+from providers.voice import ElevenLabsVoiceProvider, VoiceProvider
 
 
 class VideoPipeline:
-    def __init__(self):
+    def __init__(self, voice_provider: VoiceProvider | None = None):
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
             raise ValueError("OPENAI_API_KEY is missing from .env")
         self.llm = LLMProvider(api_key=api_key)
+        self.voice = voice_provider
 
-    def create_assets(self, request: VideoRequest) -> dict:
+    def create_assets(
+        self,
+        request: VideoRequest,
+        audio_output_path: str = "output/voice.mp3",
+    ) -> dict:
         script = self.llm.generate_script(request)
 
         validation = self.llm.validate_script(request, script)
@@ -68,8 +74,12 @@ class VideoPipeline:
                         f"Storyboard validation failed after 2 attempts: {e}"
                     ) from e
 
+        voice = self.voice or ElevenLabsVoiceProvider()
+        voice.generate(script.full_script, audio_output_path)
+
         return {
             "script": script,
             "storyboard": storyboard,
             "broll": [],
+            "audio_path": audio_output_path,
         }

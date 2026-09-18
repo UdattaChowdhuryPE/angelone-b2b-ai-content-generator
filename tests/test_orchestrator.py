@@ -99,7 +99,7 @@ def _make_script_validation(valid: bool = True) -> ScriptValidation:
 
 
 def _patch_pipeline():
-    """Return a context manager that patches LLMProvider and os.getenv."""
+    """Return context managers patching LLM, voice, and os.getenv."""
     import os
 
     real_getenv = os.getenv
@@ -111,15 +111,16 @@ def _patch_pipeline():
 
     return (
         patch("pipeline.orchestrator.LLMProvider"),
+        patch("pipeline.orchestrator.ElevenLabsVoiceProvider"),
         patch("pipeline.orchestrator.os.getenv", side_effect=fake_getenv),
     )
 
 
 def test_storyboard_retry_success():
     """First storyboard invalid, second valid. Correction prompt is passed."""
-    mock_llm_cls, mock_getenv = _patch_pipeline()
+    mock_llm_cls, mock_voice_cls, mock_getenv = _patch_pipeline()
 
-    with mock_llm_cls as MockLLM, mock_getenv:
+    with mock_llm_cls as MockLLM, mock_voice_cls, mock_getenv:
         pipeline = VideoPipeline()
         pipeline.llm = MockLLM()
 
@@ -151,9 +152,9 @@ def test_storyboard_retry_success():
 
 def test_storyboard_retry_exhausted():
     """Both attempts invalid. Raises StoryboardValidationError."""
-    mock_llm_cls, mock_getenv = _patch_pipeline()
+    mock_llm_cls, mock_voice_cls, mock_getenv = _patch_pipeline()
 
-    with mock_llm_cls as MockLLM, mock_getenv:
+    with mock_llm_cls as MockLLM, mock_voice_cls, mock_getenv:
         pipeline = VideoPipeline()
         pipeline.llm = MockLLM()
 
@@ -175,9 +176,9 @@ def test_storyboard_retry_exhausted():
 
 def test_script_validation_stops_before_storyboard():
     """Script validation fails. Storyboard is never generated."""
-    mock_llm_cls, mock_getenv = _patch_pipeline()
+    mock_llm_cls, mock_voice_cls, mock_getenv = _patch_pipeline()
 
-    with mock_llm_cls as MockLLM, mock_getenv:
+    with mock_llm_cls as MockLLM, mock_voice_cls, mock_getenv:
         pipeline = VideoPipeline()
         pipeline.llm = MockLLM()
 
@@ -195,9 +196,9 @@ def test_script_validation_stops_before_storyboard():
 
 def test_storyboard_valid_first_attempt():
     """First storyboard valid. No retry, no correction_prompt."""
-    mock_llm_cls, mock_getenv = _patch_pipeline()
+    mock_llm_cls, mock_voice_cls, mock_getenv = _patch_pipeline()
 
-    with mock_llm_cls as MockLLM, mock_getenv:
+    with mock_llm_cls as MockLLM, mock_voice_cls, mock_getenv:
         pipeline = VideoPipeline()
         pipeline.llm = MockLLM()
 
@@ -215,3 +216,61 @@ def test_storyboard_valid_first_attempt():
 
         call_kwargs = pipeline.llm.generate_storyboard.call_args
         assert call_kwargs[1].get("correction_prompt") is None
+
+
+def test_init_without_elevenlabs_keys_succeeds():
+    """VideoPipeline() constructs fine when ElevenLabs env vars are missing."""
+    import os
+
+    real_getenv = os.getenv
+
+    def fake_getenv(key, default=None):
+        if key == "OPENAI_API_KEY":
+            return "test-key-not-real"
+        if key == "ELEVENLABS_API_KEY":
+            return None
+        if key == "ELEVENLABS_VOICE_ID":
+            return None
+        return real_getenv(key, default)
+
+    with patch("pipeline.orchestrator.LLMProvider"), patch(
+        "pipeline.orchestrator.os.getenv", side_effect=fake_getenv
+    ):
+        pipeline = VideoPipeline()
+        assert pipeline.voice is None
+
+
+def test_create_assets_without_voice_creds_raises_clear_error():
+    """Voice stage fails with ValueError when ElevenLabs creds are missing."""
+    import os
+
+    real_getenv = os.getenv
+
+    def fake_getenv(key, default=None):
+        if key == "OPENAI_API_KEY":
+            return "test-key-not-real"
+        if key == "ELEVENLABS_API_KEY":
+            return None
+        if key == "ELEVENLABS_VOICE_ID":
+            return None
+        return real_getenv(key, default)
+
+    with patch("pipeline.orchestrator.LLMProvider") as MockLLM, patch(
+        "pipeline.orchestrator.os.getenv", side_effect=fake_getenv
+    ):
+        pipeline = VideoPipeline()
+        pipeline.llm = MockLLM()
+
+        pipeline.llm.generate_script.return_value = _make_script()
+        pipeline.llm.validate_script.return_value = _make_script_validation()
+        pipeline.llm.generate_storyboard.return_value = (
+            _make_valid_storyboard()
+        )
+
+        request = _make_request()
+        with pytest.raises(
+            ValueError, match="ELEVENLABS"
+        ):
+            pipeline.create_assets(request)
+
+        pipeline.llm.generate_storyboard.assert_called_once()
