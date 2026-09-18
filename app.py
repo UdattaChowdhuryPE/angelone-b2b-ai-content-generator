@@ -3,7 +3,11 @@ import os
 import streamlit as st
 from dotenv import load_dotenv
 
-from pipeline.models import VideoRequest
+from pipeline.models import (
+    VideoRequest,
+    ScriptValidationError,
+    StoryboardValidationError,
+)
 from pipeline.orchestrator import VideoPipeline
 
 
@@ -107,9 +111,9 @@ if st.button(
                 state="complete",
             )
 
-    except ValueError as error:
+    except ScriptValidationError as error:
 
-        st.error("The generated script did not pass validation.")
+        st.error("The generated script did not pass content validation.")
 
         st.warning(str(error))
 
@@ -117,6 +121,29 @@ if st.button(
             "Review the key points and make sure they contain "
             "the financial claims you want the video to communicate."
         )
+
+        st.stop()
+
+    except StoryboardValidationError as error:
+
+        st.error(
+            "Could not generate a storyboard within the time limit."
+        )
+
+        st.warning(str(error))
+
+        st.info(
+            "Try reducing the number of key points or increasing "
+            "the video duration to give the AI more time."
+        )
+
+        st.stop()
+
+    except ValueError as error:
+
+        st.error("An unexpected error occurred during generation.")
+
+        st.warning(str(error))
 
         st.stop()
 
