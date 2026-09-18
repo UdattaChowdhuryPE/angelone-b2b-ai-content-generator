@@ -8,7 +8,7 @@ def download_file(
 ):
 
     os.makedirs(
-        os.path.dirname(output_path),
+        os.path.dirname(output_path) or ".",
         exist_ok=True,
     )
 
