@@ -104,4 +104,24 @@ Prefer one meaningful financial idea per scene.
 
 The concatenated narration across all storyboard scenes
 must cover the complete final script.
+
+DURATION CONSTRAINTS (CRITICAL):
+
+1. The total_duration field MUST be less than or equal to the
+   requested target duration. NEVER exceed the target.
+
+2. Every scene's end timestamp MUST be <= the requested duration.
+
+3. Scene timestamps must cover the narration within the requested
+   duration. Do not leave large gaps or extend beyond the target.
+
+4. For a 60-second target, the storyboard MUST NOT exceed 60 seconds.
+   For a 30-second target, the storyboard MUST NOT exceed 30 seconds.
+
+5. Distribute narration proportionally across scenes so the total
+   fits within the target duration.
+
+6. If the narration cannot fit within the target duration without
+   changing the approved narration, do not modify the narration.
+   Preserve the approved script exactly.
 """
