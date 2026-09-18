@@ -39,3 +39,15 @@ class Scene(BaseModel):
 class Storyboard(BaseModel):
     scenes: List[Scene]
     total_duration: float
+
+
+class ScriptValidationError(ValueError):
+    """Raised when the generated script fails content validation."""
+
+    pass
+
+
+class StoryboardValidationError(ValueError):
+    """Raised when the generated storyboard fails structural validation."""
+
+    pass
