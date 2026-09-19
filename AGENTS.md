@@ -2,23 +2,24 @@
 
 ## Project overview
 
-AI financial video generator (V0). Expert provides financial points → AI produces script + storyboard + voice mp3. Streamlit frontend, OpenAI for LLM, uv for deps.
+AI financial video generator (V0). Expert provides financial points → AI produces script + storyboard + voice mp3 + HeyGen avatar (canonical studio background) + Higgsfield B-roll + captioned 1080x1920 final MP4. Streamlit frontend, FastAPI backend, OpenAI for LLM, uv for deps.
 
-Avatar / B-roll / final video assembly live only in isolated `scripts/` experiments — not in the production pipeline.
-
-**Core constraint:** The AI must NEVER invent financial claims, facts, stats, recommendations, or market opinions. User-supplied key points are the sole source of truth for all financial content.
+**Core constraint:** The AI must NEVER invent financial claims, facts, stats, recommendations, or market opinions. User-supplied key points are the sole source of truth for all financial content. Every script (initial + regenerations) passes the claim-validation gate.
 
 ## Quick commands
 
 ```bash
-# Run the app
-uv run streamlit run app.py
+# Run the backend (real providers by default)
+uv run uvicorn backend.app:app --port 8000
 
-# Run all tests
+# Run the frontend against the backend
+BACKEND_URL=http://localhost:8000 uv run streamlit run app.py
+
+# Run all tests (mocks only — no network/creds/FFmpeg required)
 uv run pytest
 
-# Run a single test file
-uv run pytest tests/test_validators.py
+# Opt-in paid end-to-end test only (spends real money)
+RUN_REAL_VIDEO_TEST=true uv run pytest tests/test_real_video.py -s
 
 # Install / sync deps
 uv sync
@@ -37,43 +38,53 @@ uv sync
 ## Architecture
 
 ```
-app.py                  Streamlit UI entrypoint
+app.py                  Streamlit UI (submit, staged progress, script,
+                        storyboard, MP4 preview + download, regenerate, retry)
+backend/
+  app.py                FastAPI: videos CRUD + /file (video/mp4) + script/
+                        storyboard regenerate + retry. Defaults wire REAL
+                        providers (USE_REAL_PROVIDERS); None skips a stage.
+                        Never import tests/fakes or smoke modules here.
+  worker.py             Staged run_job + regenerate_script/storyboard +
+                        retry_job; persists script.json/storyboard.json/
+                        voice.mp3/avatar.mp4/broll/captions/final.mp4.
+  store.py              In-memory JobStore + current_stage/status_detail/locks
 pipeline/
   models.py             Pydantic models (VideoRequest, Script, Storyboard, Scene)
   prompts.py            System prompts for script + storyboard generation
   validators.py         Storyboard validation (timing, coverage, sequencing)
-  orchestrator.py       VideoPipeline — script → validate → storyboard (retry) → voice
+  orchestrator.py       VideoPipeline — staged methods + create_assets() wrapper
 providers/
   llm.py                OpenAI client (gpt-5-mini-2025-08-07), structured output
   voice.py              ElevenLabs voice provider (VoiceProvider base + ElevenLabsVoiceProvider)
   avatar.py             Stub (raises NotImplementedError — do not use)
-  heygen.py             HeyGen avatar adapter (upload audio → create → poll → download)
-  higgsfield.py         Higgsfield B-roll adapter (submit → poll → wait)
+  heygen.py             HeyGen adapter incl. generate() (Avatar IV, 9:16, 720p
+                        source + canonical studio bg at
+                        assets/backgrounds/studio_background.png)
+  higgsfield.py         Higgsfield adapter incl. fetch() (5s silent 720p clips)
 video/
+  captions.py           V0.9-ported captions (verbatim cards, Pillow PNGs,
+                        burned in via overlay) at 1080x1920
+  compositor.py         compose_final() + ffprobe validate_mp4() (exactly
+                        1080x1920 H.264/AAC/faststart or fail)
   storyboard.py         B-roll scene extraction
-  compositor.py         ffmpeg vertical video render (1080x1920)
   assets.py             File download helper
-scripts/                Isolated paid/local experiments (V0.4–V0.11c, never edit prod code)
-output/                 Generated artifacts (voice.mp3, timelines, mp4s — gitignored)
-tests/
-  test_validators.py    Storyboard validation tests (pure, no API calls)
-  test_prompts.py       Prompt existence tests
-  test_orchestrator.py  Pipeline retry / validation gating / lazy voice init (mocked)
-  test_voice.py         ElevenLabs request shape + pipeline voice wiring (mocked)
-  test_heygen.py        HeyGen upload / create / poll / error paths (mocked)
+scripts/                Isolated paid/local experiments (V0.4–V0.11c, reference only)
+output/<job_id>/        Per-job artifacts (gitignored)
+tests/                  pytest with mocks; test_real_video.py is opt-in paid
 ```
 
 ## Pipeline flow
 
-`VideoPipeline.create_assets()` in `pipeline/orchestrator.py`:
+`VideoPipeline` staged methods in `pipeline/orchestrator.py` + `backend/worker.py`:
 
-1. `LLMProvider.generate_script()` — creates Script from user key points
-2. `LLMProvider.validate_script()` — checks script doesn't add unsupported claims; raises `ScriptValidationError` on failure, storyboard is never attempted
-3. `LLMProvider.generate_storyboard()` — creates scenes with timing + visuals (max 2 attempts; 2nd attempt appends a `correction_prompt` that keeps narration word-identical and fixes only timestamps)
-4. `validate_storyboard()` — enforces timing rules (no overlaps, sequential IDs, first scene at 0s, within duration)
-5. Voice — `self.voice or ElevenLabsVoiceProvider()` then `voice.generate(script.full_script, audio_output_path)` (default `output/voice.mp3`). Returns `{script, storyboard, broll: [], audio_path}`.
+1. `create_script()` — creates Script from user key points
+2. `validate_script_or_raise()` — raises `ScriptValidationError` on unsupported claims; storyboard never attempted
+3. `create_storyboard()` — scenes with timing + visuals (max 2 attempts)
+4. `validate_storyboard()` — timing rules (no overlaps, sequential IDs, first scene at 0s, within duration)
+5. Voice → `voice.mp3` → Avatar (HeyGen + canonical bg) → B-roll (Higgsfield) → `compose_final()` → validated `final.mp4`
 
-HeyGen / Higgsfield / `video/compositor.py` are NOT called from the orchestrator — see `scripts/` experiments.
+Regen (`script/regenerate`, `storyboard/regenerate`) re-runs the claim gate and rebuilds downstream; `retry` resumes from the failed stage reusing paid artifacts. No automatic provider retries.
 
 ## Storyboard validation rules (`pipeline/validators.py`)
 
@@ -109,7 +120,12 @@ Isolated, deterministic experiments. No LLM rewrites, no prod-code edits, no `pi
 - `tests/test_prompts.py` — sanity checks on prompt strings
 - `tests/test_orchestrator.py` — storyboard retry success/exhaustion, script-gating, lazy voice init
 - `tests/test_voice.py` — ElevenLabs request shape, env auth, file write, pipeline voice wiring
-- `tests/test_heygen.py` — HeyGen upload/create/poll/timeout/error paths
+- `tests/test_heygen.py` + `test_heygen_generate.py` — HeyGen upload/create/poll/timeout/error paths + `generate()` incl. studio-bg payload
+- `tests/test_higgsfield.py` — B-roll payload shape (no narration), ordering, metadata, failure paths
+- `tests/test_captions.py` + `test_compositor.py` — verbatim caption cards/1080x1920 render + FFmpeg cmd shape, failure, `validate_mp4`
+- `tests/test_compositor_integration.py` (`integration` mark) — real local FFmpeg assembly when installed
+- `tests/test_real_video.py` — opt-in paid end-to-end only (`RUN_REAL_VIDEO_TEST=true`)
+- `tests/test_worker_stages.py`, `test_api_endpoints.py` — stage progression, persistence, regen validation-failure preservation, retry resume, file serving, no-fake-imports guard
 - No lint/typecheck tooling configured yet — just pytest
 
 ## Conventions
@@ -127,6 +143,7 @@ Isolated, deterministic experiments. No LLM rewrites, no prod-code edits, no `pi
 - `VideoPipeline()` constructs without ElevenLabs keys (lazy init); `create_assets()` raises `ValueError(ELEVENLABS_*)` when voice creds are missing
 - `providers/avatar.py` still raises `NotImplementedError` — avatar work uses `providers/heygen.py` instead
 - `providers/higgsfield.py` will raise `ValueError` if HF env vars are empty — only use when keys are set
-- HeyGen: the configured public avatar only supports the Avatar III engine — Avatar IV/V return 400 for it
+- HeyGen: production renders use the Avatar IV engine (9:16, 720p source, canonical studio bg, fit cover + remove_background)
 - `ffmpeg` must be installed on the system for `video/compositor.py` and `scripts/` assemblies to work
-- The production pipeline returns `result["broll"] = []` and `result["audio_path"]` — B-roll / avatar / final mp4 only exist as `scripts/` + `output/` experiments in V0
+- Provider sources are 720x1280 (HeyGen/Higgsfield `720p`); the composed final is always exactly 1080x1920 (`validate_mp4` fails otherwise)
+- Canonical studio background lives at `assets/backgrounds/studio_background.png` — never substitute experimental backgrounds
