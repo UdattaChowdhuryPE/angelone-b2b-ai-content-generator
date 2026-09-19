@@ -1,9 +1,74 @@
 import os
+import tempfile
 import time
 
 import requests
 
 from video.assets import download_file
+
+
+#: HeyGen Avatar IV native source size. The upload background variant
+#: is normalized to exactly this size (proportional cover + minimal
+#: center crop) so HeyGen never has to contain/letterbox it.
+UPLOAD_WIDTH = 720
+UPLOAD_HEIGHT = 1280
+
+
+def build_zoomed_out_background(
+    source_path: str,
+    output_path: str | None = None,
+    scale: float = 0.9,
+):
+    """Derive the HeyGen upload variant of the canonical bg.
+
+    Proportional cover to exactly 720x1280 (HeyGen Avatar IV native):
+
+    - proportional scaling (no distortion)
+    - scale = max(720/w, 1280/h) so the frame is fully covered
+    - minimal center crop of only the excess dimension
+    - no padding, no white/blank borders
+
+    Source and target aspect ratios differ slightly, so a minimal
+    crop is mathematically required (for 1536x2752: ~10px of height).
+
+    The ``scale`` argument is legacy (previous 90% zoom-out) and is
+    ignored for geometry; it is still validated to (0, 1) so existing
+    callers/tests passing ``scale=0.9`` keep working. The canonical
+    file is only read — never modified. Returns a PIL Image when
+    output_path is None, else writes the PNG and returns output_path.
+    """
+    import math
+
+    from PIL import Image
+
+    if not 0 < scale < 1:
+        raise ValueError(f"scale must be in (0, 1), got {scale}")
+    if not os.path.exists(source_path):
+        raise FileNotFoundError(
+            f"Background source not found: {source_path}"
+        )
+    img = Image.open(source_path).convert("RGB")
+    width, height = img.size
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Invalid source dimensions: {width}x{height}")
+    factor = max(UPLOAD_WIDTH / width, UPLOAD_HEIGHT / height)
+    scaled_size = (
+        max(1, math.ceil(width * factor)),
+        max(1, math.ceil(height * factor)),
+    )
+    resized = img.resize(scaled_size, Image.LANCZOS)
+    left = (resized.width - UPLOAD_WIDTH) // 2
+    top = (resized.height - UPLOAD_HEIGHT) // 2
+    out = resized.crop(
+        (left, top, left + UPLOAD_WIDTH, top + UPLOAD_HEIGHT)
+    )
+    if output_path is None:
+        return out
+    parent = os.path.dirname(output_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    out.save(output_path)
+    return output_path
 
 
 class HeyGenAvatarProvider:
@@ -16,13 +81,39 @@ class HeyGenAvatarProvider:
 
     BASE_URL = "https://api.heygen.com"
 
+    #: Single source of truth for the V0 studio background. Used for every
+    #: avatar render (initial generation, regenerations, retries). Never
+    #: generate or substitute experimental backgrounds from scripts/.
+    #: At upload time a cover-normalized 720x1280 variant is built from
+    #: this file (see build_zoomed_out_background) — the canonical file
+    #: itself is never modified or replaced.
+    STUDIO_BACKGROUND_PATH = "assets/backgrounds/studio_background.png"
+
+    #: Legacy zoom argument kept for backward compatibility with existing
+    #: callers/tests. Geometry is now a proportional cover to exactly
+    #: 720x1280 (no shrink, no padding, no white borders, minimal center
+    #: crop). HeyGen fit stays "cover".
+    BACKGROUND_ZOOM = 0.9
+
+    #: HeyGen renders the avatar source at 720p/9:16. The production
+    #: compositor upscales to the 1080x1920 final — see video/compositor.py.
+    SOURCE_RESOLUTION = "720p"
+    SOURCE_ASPECT_RATIO = "9:16"
+
     def __init__(
         self,
         api_key: str | None = None,
         avatar_id: str | None = None,
+        background_image_path: str | None = None,
     ):
         self.api_key = api_key or os.getenv("HEYGEN_API_KEY")
         self.avatar_id = avatar_id or os.getenv("HEYGEN_AVATAR_ID")
+        if background_image_path is not None:
+            self.background_image_path = background_image_path
+        else:
+            self.background_image_path = os.getenv(
+                "HEYGEN_BACKGROUND_IMAGE", self.STUDIO_BACKGROUND_PATH
+            )
 
         if not self.api_key:
             raise ValueError("HEYGEN_API_KEY is missing from .env")
@@ -61,10 +152,11 @@ class HeyGenAvatarProvider:
         aspect_ratio: str = "9:16",
         resolution: str = "720p",
         engine: dict | None = None,
+        background_asset_id: str | None = None,
     ) -> dict:
-        # NOTE: the configured public avatar (Aditya_public_*) only
-        # supports the Avatar III engine — Avatar IV (API default)
-        # and Avatar V both return 400 for it.
+        # Production engine is Avatar IV on the configured avatar.
+        # fit=cover keeps the 9:16 frame full-bleed; remove_background
+        # mattes the avatar over the canonical studio PNG.
         payload = {
             "type": "avatar",
             "avatar_id": self.avatar_id,
@@ -72,8 +164,17 @@ class HeyGenAvatarProvider:
             "title": title,
             "aspect_ratio": aspect_ratio,
             "resolution": resolution,
-            "engine": engine or {"type": "avatar_iii"},
+            "engine": engine or {"type": "avatar_iv"},
         }
+        if background_asset_id is not None:
+            # Native HeyGen studio-background path (proven in V0.11):
+            # matte the avatar over the canonical studio PNG.
+            payload["fit"] = "cover"
+            payload["background"] = {
+                "type": "image",
+                "asset_id": background_asset_id,
+            }
+            payload["remove_background"] = True
         response = requests.post(
             f"{self.BASE_URL}/v3/videos",
             headers={**self.headers, "Content-Type": "application/json"},
@@ -117,3 +218,111 @@ class HeyGenAvatarProvider:
 
     def download_video(self, video_url: str, output_path: str) -> str:
         return download_file(video_url, output_path)
+
+    def upload_image(self, image_path: str) -> str:
+        """Upload a background image asset, returning its asset_id."""
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(
+                f"Background image not found: {image_path}"
+            )
+        if os.path.getsize(image_path) == 0:
+            raise ValueError(f"Background image is empty: {image_path}")
+        with open(image_path, "rb") as f:
+            response = requests.post(
+                f"{self.BASE_URL}/v3/assets",
+                headers=self.headers,
+                files={
+                    "file": (
+                        os.path.basename(image_path),
+                        f,
+                        "image/png",
+                    )
+                },
+                timeout=120,
+            )
+        response.raise_for_status()
+        data = response.json().get("data", {})
+        asset_id = data.get("asset_id")
+        if not asset_id:
+            raise RuntimeError(
+                "HeyGen image upload returned no asset_id: "
+                f"{response.text}"
+            )
+        return asset_id
+
+    def _prepare_background_upload(self) -> str:
+        """Build the cover-normalized 720x1280 upload variant.
+
+        Returns the temp PNG path (caller deletes it after upload).
+        The canonical file on disk is never modified or replaced.
+        """
+        bg_path = self.background_image_path
+        if not bg_path or not os.path.exists(bg_path):
+            raise FileNotFoundError(
+                "Canonical studio background missing: "
+                f"{bg_path!r}. Expected at "
+                f"{self.STUDIO_BACKGROUND_PATH}."
+            )
+        fd, tmp = tempfile.mkstemp(
+            prefix="studio_bg_upload_", suffix=".png"
+        )
+        os.close(fd)
+        return build_zoomed_out_background(
+            bg_path, tmp, scale=self.BACKGROUND_ZOOM
+        )
+
+    def generate(
+        self,
+        audio_path: str,
+        output_path: str,
+        poll_interval: int = 10,
+        timeout: int = 600,
+    ) -> str:
+        """Worker-compatible avatar render: audio -> studio-bg avatar MP4.
+
+        Uploads the narration audio AND a cover-normalized 720x1280
+        variant of the canonical studio background, creates the avatar
+        video (Avatar IV, 9:16, 720p source), waits for completion,
+        downloads the MP4 to output_path. Returns output_path.
+        API errors propagate — never swallowed, never faked.
+        """
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        parent = os.path.dirname(output_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        bg_path = self.background_image_path
+        if not bg_path or not os.path.exists(bg_path):
+            raise FileNotFoundError(
+                "Canonical studio background missing: "
+                f"{bg_path!r}. Expected at "
+                f"{self.STUDIO_BACKGROUND_PATH}."
+            )
+
+        audio_asset_id = self.upload_audio(audio_path)
+        upload_bg_path = self._prepare_background_upload()
+        try:
+            bg_asset_id = self.upload_image(upload_bg_path)
+        finally:
+            if upload_bg_path != bg_path and os.path.exists(upload_bg_path):
+                os.remove(upload_bg_path)
+        created = self.create_video(
+            audio_asset_id,
+            background_asset_id=bg_asset_id,
+        )
+        video_id = created.get("data", {}).get("video_id")
+        if not video_id:
+            raise RuntimeError(
+                f"HeyGen create returned no video_id: {created}"
+            )
+        final = self.wait_for_result(
+            video_id, poll_interval=poll_interval, timeout=timeout
+        )
+        data = final.get("data", {})
+        video_url = data.get("video_url") or data.get("url")
+        if not video_url:
+            raise RuntimeError(
+                f"HeyGen completed with no video_url: {final}"
+            )
+        return self.download_video(video_url, output_path)

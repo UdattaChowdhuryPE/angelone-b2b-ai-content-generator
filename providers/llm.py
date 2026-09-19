@@ -226,6 +226,13 @@ Prefer:
 Avoid generic financial B-roll when a more specific visual
 would communicate the idea better.
 
+B-ROLL INTENT: set broll_required=true only for scenes where
+real-world contextual footage helps the viewer understand the point,
+always with a concrete non-financial visual_prompt (camera-visible
+content only — no numbers, brands, text, claims, or opinions). Other
+scenes stay broll_required=false. Never force B-roll onto every scene;
+the user's key points remain the sole source of financial truth.
+
 SCENE COVERAGE:
 
 Every meaningful idea in the final script must appear in

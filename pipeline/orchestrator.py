@@ -2,7 +2,9 @@ import os
 
 from pipeline.models import (
     VideoRequest,
+    Script,
     ScriptValidationError,
+    Storyboard,
     StoryboardValidationError,
 )
 from pipeline.validators import validate_storyboard
@@ -11,11 +13,14 @@ from providers.voice import ElevenLabsVoiceProvider, VoiceProvider
 
 
 class VideoPipeline:
-    def __init__(self, voice_provider: VoiceProvider | None = None):
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY is missing from .env")
-        self.llm = LLMProvider(api_key=api_key)
+    def __init__(self, llm_provider=None, voice_provider: VoiceProvider | None = None):
+        if llm_provider is not None:
+            self.llm = llm_provider
+        else:
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise ValueError("OPENAI_API_KEY is missing from .env")
+            self.llm = LLMProvider(api_key=api_key)
         self.voice = voice_provider
 
     def create_assets(
@@ -23,15 +28,35 @@ class VideoPipeline:
         request: VideoRequest,
         audio_output_path: str = "output/voice.mp3",
     ) -> dict:
-        script = self.llm.generate_script(request)
+        script = self.create_script(request)
+        self.validate_script_or_raise(request, script)
+        storyboard = self.create_storyboard(request, script)
+        self.create_voice(script, audio_output_path)
 
+        return {
+            "script": script,
+            "storyboard": storyboard,
+            "broll": [],
+            "audio_path": audio_output_path,
+        }
+
+    def create_script(self, request: VideoRequest) -> Script:
+        return self.llm.generate_script(request)
+
+    def validate_script_or_raise(
+        self, request: VideoRequest, script: Script
+    ):
         validation = self.llm.validate_script(request, script)
         if not validation.valid:
             raise ScriptValidationError(
                 "Unsupported claims: "
                 + ", ".join(validation.unsupported_claims)
             )
+        return validation
 
+    def create_storyboard(
+        self, request: VideoRequest, script: Script
+    ) -> Storyboard:
         storyboard = None
         last_error = None
 
@@ -74,12 +99,9 @@ class VideoPipeline:
                         f"Storyboard validation failed after 2 attempts: {e}"
                     ) from e
 
+        return storyboard
+
+    def create_voice(self, script: Script, audio_output_path: str) -> str:
         voice = self.voice or ElevenLabsVoiceProvider()
         voice.generate(script.full_script, audio_output_path)
-
-        return {
-            "script": script,
-            "storyboard": storyboard,
-            "broll": [],
-            "audio_path": audio_output_path,
-        }
+        return audio_output_path

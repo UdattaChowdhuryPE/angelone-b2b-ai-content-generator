@@ -84,11 +84,23 @@ For every scene:
    - simple diagrams
    - arrows / causal flows
    - charts based only on supplied information
-   - relevant contextual footage
-   - animated typography
-   - avatar when direct explanation is appropriate
+    - relevant contextual footage
+    - animated typography
+    - avatar when direct explanation is appropriate
 5. Avoid generic financial B-roll when a diagram or specific
    visual would communicate the idea more clearly.
+
+B-ROLL INTENT RULE:
+
+Set broll_required=true ONLY for scenes where real-world contextual
+footage helps the viewer understand the point. Every broll_required
+scene MUST include a concrete, non-financial visual_prompt describing
+only what the camera shows — no numbers, brands, readable text,
+claims, or opinions. Scenes better served by direct explanation stay
+broll_required=false. Never force B-roll onto every scene, and never
+invent financial substance in a visual_prompt: the user's key points
+remain the sole source of truth.
+
 
 SCENE COVERAGE RULE:
 

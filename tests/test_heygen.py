@@ -61,7 +61,8 @@ def test_create_video_posts_avatar_audio_asset():
     assert payload["avatar_id"] == "test-avatar-id"
     assert payload["audio_asset_id"] == "ast_123"
     assert payload["aspect_ratio"] == "9:16"
-    assert payload["engine"] == {"type": "avatar_iii"}
+    assert payload["resolution"] == "720p"
+    assert payload["engine"] == {"type": "avatar_iv"}
 
 
 def test_wait_for_result_polls_until_completed():

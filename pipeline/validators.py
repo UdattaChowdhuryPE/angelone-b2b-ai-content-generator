@@ -48,3 +48,10 @@ def validate_storyboard(storyboard: Storyboard, requested_duration: int) -> None
                 f"Scene IDs are not sequential: expected scene ID {expected_id} "
                 f"but got {scene.scene_id} at position {i + 1}"
             )
+
+    for scene in storyboard.scenes:
+        if scene.broll_required and not (scene.visual_prompt or "").strip():
+            raise StoryboardValidationError(
+                f"Scene {scene.scene_id} sets broll_required=true but has no "
+                "usable visual_prompt — B-roll intent is invalid."
+            )
