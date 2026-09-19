@@ -1,0 +1,30 @@
+# Production frontend image (Phase 2 — deployment only, no app changes).
+#
+# Build:  docker build -f Dockerfile.frontend -t vid-frontend:prod .
+# Run:    docker run -p 8501:8501 \
+#           -e PORT=8501 \
+#           -e BACKEND_URL=https://<backend-public-url> \
+#           vid-frontend:prod
+#
+# No volume needed (MP4s are fetched over HTTP via /file).
+# No secrets in this image (BACKEND_URL only). No .env (see .dockerignore).
+
+FROM python:3.11-slim
+
+# uv for dependency management (this repo uses uv, not pip).
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
+
+# Streamlit entrypoint only.
+COPY app.py ./
+
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8501
+
+# ${PORT:-8501} honors platform-injected PORT.
+CMD ["sh", "-c", "uv run streamlit run app.py --server.port ${PORT:-8501} --server.address 0.0.0.0 --server.headless true"]

@@ -1,0 +1,17 @@
+# Never bake local state, secrets, or job artifacts into images.
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+.git/
+output/
+.docker-data/
+assets/generated/
+*.mp4
+*.wav
+*.mp3
+*.avi
+*.mov
+*.mkv

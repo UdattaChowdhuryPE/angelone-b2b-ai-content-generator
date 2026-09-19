@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync dependencies
+        run: uv sync --frozen
+
+      # The paid end-to-end test (tests/test_real_video.py) skips unless
+      # RUN_REAL_VIDEO_TEST is set. CI must never set it — this step fails
+      # the build if it is present, so paid providers can never be called.
+      - name: Assert paid E2E is disarmed
+        run: test -z "${RUN_REAL_VIDEO_TEST:-}"
+
+      - name: Run safe test suite
+        run: uv run pytest -q
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build-only verification: no secrets, no app/provider invocation,
+      # no image push from PR builds.
+      - name: Build backend image
+        run: docker build -f Dockerfile.backend -t vid-backend:ci .
+
+      - name: Build frontend image
+        run: docker build -f Dockerfile.frontend -t vid-frontend:ci .

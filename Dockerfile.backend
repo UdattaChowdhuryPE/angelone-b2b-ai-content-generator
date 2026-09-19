@@ -1,0 +1,52 @@
+# Production backend image (Phase 2 — deployment only, no app changes).
+#
+# Build:  docker build -f Dockerfile.backend -t vid-backend:prod .
+# Run:    docker run -p 8000:8000 \
+#           -v "$(pwd)/.docker-data:/data" \
+#           -e OUTPUT_DIR=/data/output \
+#           -e PORT=8000 \
+#           --env-file /dev/null \
+#           vid-backend:prod
+# Secrets (OPENAI_API_KEY, ELEVENLABS_*, HEYGEN_*, HF_*) are injected at
+# runtime via the platform secret manager — never baked into the image
+# and never read from a .env file (see .dockerignore).
+
+FROM python:3.11-slim
+
+# System deps: ffmpeg (ships ffprobe — both mandatory for artifact
+# validation) + DejaVu fonts (caption PNGs fail hard without a font).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    fonts-dejavu \
+    && rm -rf /var/lib/apt/lists/*
+
+# uv for dependency management (this repo uses uv, not pip).
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Repo root is the WORKDIR: the app relies on repository-relative paths
+# (assets/backgrounds/studio_background.png, OUTPUT_DIR default "output").
+WORKDIR /app
+
+# Dependencies first for layer caching.
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
+
+# Application + canonical assets (studio background must be in the image).
+COPY backend/ ./backend/
+COPY pipeline/ ./pipeline/
+COPY providers/ ./providers/
+COPY video/ ./video/
+COPY assets/ ./assets/
+
+# Persistent-volume mount point. Railway mounts its volume at /data and
+# sets OUTPUT_DIR=/data/output at runtime; the mkdir keeps local
+# `docker run -v ...:/data` working identically.
+RUN mkdir -p /data/output
+ENV OUTPUT_DIR=/data/output
+ENV PYTHONUNBUFFERED=1
+
+EXPOSE 8000
+
+# Exactly one uvicorn worker: JobStore is single-process in-memory.
+# No gunicorn, no reload. ${PORT:-8000} honors platform-injected PORT.
+CMD ["sh", "-c", "uv run uvicorn backend.app:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
