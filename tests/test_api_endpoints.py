@@ -44,9 +44,22 @@ def _completed_client(tmp_path, calls, **overrides):
     app = create_app(store=store, output_root=str(tmp_path), **wiring)
     client = TestClient(app)
     job_id = client.post("/api/videos", json=_payload()).json()["job_id"]
-    job = client.get(f"/api/videos/{job_id}").json()
+    job = _poll_terminal(client, job_id)
     assert job["status"] == "completed"
     return client, store, job_id
+
+
+def _poll_terminal(client, job_id, timeout=30):
+    """Poll GET until the background task reaches a terminal state."""
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        job = client.get(f"/api/videos/{job_id}").json()
+        if job["status"] in ("completed", "failed"):
+            return job
+        time.sleep(0.05)
+    raise AssertionError(f"job {job_id} did not reach a terminal state")
 
 
 def test_status_includes_stages_script_storyboard(tmp_path):
@@ -84,11 +97,13 @@ def test_script_regenerate_rebuilds_downstream(tmp_path):
     )
     client = TestClient(app)
     job_id = client.post("/api/videos", json=_payload()).json()["job_id"]
+    _poll_terminal(client, job_id)
     voice_calls_before = calls.count("stage.create_voice")
 
     resp = client.post(f"/api/videos/{job_id}/script/regenerate")
     assert resp.status_code == 202
-    job = resp.json()
+    assert resp.json()["status"] == "processing"  # async: returns immediately
+    job = _poll_terminal(client, job_id)
     assert job["status"] == "completed"
     assert job["script"]["full_script"].startswith("Brand new hook")
     voice_calls_after = calls.count("stage.create_voice")
@@ -102,6 +117,7 @@ def test_script_regenerate_rebuilds_downstream(tmp_path):
 
 
 def test_script_regenerate_validation_failure_preserves_working_video(tmp_path):
+    """Paid claim-gate failure is async: failed job, artifacts preserved."""
     calls: list = []
     store = JobStore()
     runs = []
@@ -122,19 +138,21 @@ def test_script_regenerate_validation_failure_preserves_working_video(tmp_path):
     )
     client = TestClient(app)
     job_id = client.post("/api/videos", json=_payload()).json()["job_id"]
-    before = client.get(f"/api/videos/{job_id}").json()
+    before = _poll_terminal(client, job_id)
     assert before["status"] == "completed"
     final_before = os.path.join(str(tmp_path), job_id, "artifact.txt")
     assert os.path.exists(final_before)
 
+    # Async contract: 202 accepted, failure surfaces through polling.
     resp = client.post(f"/api/videos/{job_id}/script/regenerate")
-    assert resp.status_code == 422
-    assert "unsupported" in str(resp.json()["detail"]).lower()
+    assert resp.status_code == 202
 
-    after = client.get(f"/api/videos/{job_id}").json()
-    assert after["status"] == "completed"  # working video NOT destroyed
+    after = _poll_terminal(client, job_id)
+    assert after["status"] == "failed"  # surfaced via polling, not 422
+    assert after["failed_stage"] == "script_validation"
     assert after["script"]["full_script"] == before["script"]["full_script"]
-    assert os.path.exists(final_before)
+    assert os.path.exists(final_before)  # previous video NOT destroyed
+    assert store.get(job_id)["locked_by"] is None  # lock always released
 
 
 def test_storyboard_regenerate_preserves_script(tmp_path):
@@ -160,11 +178,13 @@ def test_storyboard_regenerate_preserves_script(tmp_path):
     )
     client = TestClient(app)
     job_id = client.post("/api/videos", json=_payload()).json()["job_id"]
-    before = client.get(f"/api/videos/{job_id}").json()
+    before = _poll_terminal(client, job_id)
+    assert before["status"] == "completed"
 
     resp = client.post(f"/api/videos/{job_id}/storyboard/regenerate")
     assert resp.status_code == 202
-    job = resp.json()
+    assert resp.json()["status"] == "processing"  # async: returns immediately
+    job = _poll_terminal(client, job_id)
     assert job["status"] == "completed"
     assert job["script"] == before["script"]  # script untouched
     assert job["storyboard"]["scenes"][0]["narration"] == (
@@ -198,14 +218,15 @@ def test_retry_resumes_from_failed_avatar_without_regenerating_voice(tmp_path):
     )
     client = TestClient(app)
     job_id = client.post("/api/videos", json=_payload()).json()["job_id"]
-    failed = client.get(f"/api/videos/{job_id}").json()
+    failed = _poll_terminal(client, job_id)
     assert failed["status"] == "failed"
     voice_runs = calls.count("stage.create_voice")
     assert voice_runs == 1
 
     resp = client.post(f"/api/videos/{job_id}/retry")
     assert resp.status_code == 202
-    job = resp.json()
+    assert resp.json()["status"] == "processing"  # async: returns immediately
+    job = _poll_terminal(client, job_id)
     assert job["status"] == "completed"
     # Voice NOT regenerated (paid stage reused); avatar retried.
     assert calls.count("stage.create_voice") == 1

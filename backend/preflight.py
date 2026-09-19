@@ -125,7 +125,8 @@ def check_output_writable(output_root: str = "output") -> dict:
         fd, tmp = tempfile.mkstemp(dir=output_root)
         os.close(fd)
         os.remove(tmp)
-        return _check("output_writable", PASS, output_root)
+        # Absolute path so operators can confirm the persistent mount.
+        return _check("output_writable", PASS, os.path.abspath(output_root))
     except Exception as exc:
         return _check(
             "output_writable", FAIL, f"{output_root}: {exc}"

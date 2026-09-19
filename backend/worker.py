@@ -29,7 +29,10 @@ from backend.store import (
 )
 from pipeline.models import Script, Storyboard, VideoRequest
 
-OUTPUT_ROOT = "output"
+#: Configurable artifact root. Local default is "output"; production mounts
+#: a persistent volume and sets OUTPUT_DIR=/data/output. The per-job
+#: layout ($OUTPUT_DIR/<job_id>/) is unchanged.
+OUTPUT_ROOT = os.getenv("OUTPUT_DIR", "output")
 
 SCRIPT_FILENAME = "script.json"
 STORYBOARD_FILENAME = "storyboard.json"
@@ -1007,34 +1010,27 @@ def run_job(
         return _fail_job(store, job_id, exc, job_dir=job_dir)
 
 
-def regenerate_script(
+def _regenerate_script_locked(
     job_id: str,
     store,
+    job: dict,
     pipeline_factory: Callable = default_pipeline_factory,
     avatar_provider=USE_REAL_PROVIDERS,
     broll_provider=USE_REAL_PROVIDERS,
     compositor_fn: Callable = USE_REAL_PROVIDERS,
     output_root: str = OUTPUT_ROOT,
 ) -> dict:
-    """Generate a new validated script, then regenerate all downstream stages.
+    """Regen body. Lock is held by the caller; never raises RegenValidationError.
 
-    The financial-claim gate runs again; on failure the previous valid
-    script and downstream artifacts are preserved and RegenValidationError
-    is raised (caller maps to 422 — the job itself is NOT failed).
-
-    Provider args default to USE_REAL_PROVIDERS; pass None to skip a stage.
+    Paid claim-gate failure is persisted as a failed job at script_validation
+    (previous valid script + downstream artifacts preserved) so background
+    callers surface it through normal job polling.
     """
     from pipeline.models import ScriptValidationError
 
-    job = store.get(job_id)
-    if job is None:
-        raise KeyError(f"job not found: {job_id}")
-    owner = f"regen-script-{job_id}"
-    if not store.acquire_lock(job_id, owner):
-        raise JobConflictError("job is currently running another operation")
+    job_dir = _job_dir(output_root, job_id)
     try:
         store.set_status(job_id, PROCESSING)
-        job_dir = _job_dir(output_root, job_id)
         os.makedirs(job_dir, exist_ok=True)
         request = VideoRequest(**(job["request"] or {}))
         pipeline = pipeline_factory()
@@ -1081,20 +1077,28 @@ def regenerate_script(
             requested_duration=request.duration_seconds,
         )
         return _finish_job(store, job_id, job_dir, summary)
-    except (RegenValidationError, JobConflictError):
-        # Preserve the last good state; surface via the endpoint.
-        store.set_status(job_id, job.get("status", FAILED))
-        _set_stage(
-            store, job_id, job.get("current_stage", STAGE_FAILED)
+    except RegenValidationError as exc:
+        # Preserve the last good state; surface as a failed job (pollable),
+        # never as an exception out of a background task.
+        completed = _completed_artifacts(job_dir)
+        store.update(
+            job_id,
+            status=FAILED,
+            error=str(exc),
+            error_type="RegenValidationError",
+            failed_stage=STAGE_SCRIPT_VALIDATION,
+            operation="llm.validate_script",
+            completed_artifacts=completed or None,
+            skipped_stages=_skipped_stages(STAGE_SCRIPT_VALIDATION),
+            current_stage=STAGE_FAILED,
+            status_detail=f"{STAGE_DETAILS[STAGE_FAILED]} {exc}",
         )
-        raise
+        return store.get(job_id)
     except Exception as exc:
         return _fail_job(store, job_id, exc, job_dir=job_dir)
-    finally:
-        store.release_lock(job_id, owner)
 
 
-def regenerate_storyboard(
+def regenerate_script(
     job_id: str,
     store,
     pipeline_factory: Callable = default_pipeline_factory,
@@ -1103,18 +1107,89 @@ def regenerate_storyboard(
     compositor_fn: Callable = USE_REAL_PROVIDERS,
     output_root: str = OUTPUT_ROOT,
 ) -> dict:
-    """New storyboard from the existing valid script; downstream regenerates.
+    """Generate a new validated script, then regenerate all downstream stages.
 
-    Provider args default to USE_REAL_PROVIDERS; pass None to skip a stage."""
+    Synchronous variant (direct calls). The HTTP API enqueues
+    run_regenerate_script_bg instead so paid work never blocks a request.
+
+    Provider args default to USE_REAL_PROVIDERS; pass None to skip a stage.
+    """
     job = store.get(job_id)
     if job is None:
         raise KeyError(f"job not found: {job_id}")
-    owner = f"regen-storyboard-{job_id}"
+    owner = f"regen-script-{job_id}"
     if not store.acquire_lock(job_id, owner):
         raise JobConflictError("job is currently running another operation")
     try:
+        return _regenerate_script_locked(
+            job_id,
+            store,
+            job,
+            pipeline_factory,
+            avatar_provider,
+            broll_provider,
+            compositor_fn,
+            output_root,
+        )
+    finally:
+        store.release_lock(job_id, owner)
+
+
+def run_regenerate_script_bg(
+    job_id: str,
+    store,
+    owner: str,
+    pipeline_factory: Callable = default_pipeline_factory,
+    avatar_provider=USE_REAL_PROVIDERS,
+    broll_provider=USE_REAL_PROVIDERS,
+    compositor_fn: Callable = USE_REAL_PROVIDERS,
+    output_root: str = OUTPUT_ROOT,
+) -> dict:
+    """BackgroundTasks entry for script regeneration.
+
+    The endpoint already holds ``owner``'s lock and marked the job
+    processing. Never raises — failures persist into job state and the
+    lock is always released. Paid stages are never auto-retried here.
+    """
+    try:
+        job = store.get(job_id)
+        if job is None:
+            return {"job_id": job_id, "status": FAILED, "error": "job not found"}
+        return _regenerate_script_locked(
+            job_id,
+            store,
+            job,
+            pipeline_factory,
+            avatar_provider,
+            broll_provider,
+            compositor_fn,
+            output_root,
+        )
+    except Exception as exc:  # safety net; body already maps known failures
+        try:
+            return _fail_job(
+                store, job_id, exc, job_dir=_job_dir(output_root, job_id)
+            )
+        except Exception:
+            return store.get(job_id)
+    finally:
+        store.release_lock(job_id, owner)
+
+
+def _regenerate_storyboard_locked(
+    job_id: str,
+    store,
+    job: dict,
+    pipeline_factory: Callable = default_pipeline_factory,
+    avatar_provider=USE_REAL_PROVIDERS,
+    broll_provider=USE_REAL_PROVIDERS,
+    compositor_fn: Callable = USE_REAL_PROVIDERS,
+    output_root: str = OUTPUT_ROOT,
+) -> dict:
+    """Storyboard-regen body. Lock is held by the caller."""
+    job_dir = _job_dir(output_root, job_id)
+    try:
         store.set_status(job_id, PROCESSING)
-        job_dir = _job_dir(output_root, job_id)
         request = VideoRequest(**(job["request"] or {}))
         script = load_stored_script(job_dir)
         if script is None:
@@ -1152,15 +1227,11 @@ def regenerate_storyboard(
             requested_duration=request.duration_seconds,
         )
         return _finish_job(store, job_id, job_dir, summary)
-    except (JobConflictError, KeyError):
-        raise
     except Exception as exc:
         return _fail_job(store, job_id, exc, job_dir=job_dir)
-    finally:
-        store.release_lock(job_id, owner)
 
 
-def retry_job(
+def regenerate_storyboard(
     job_id: str,
     store,
     pipeline_factory: Callable = default_pipeline_factory,
@@ -1169,17 +1240,82 @@ def retry_job(
     compositor_fn: Callable = USE_REAL_PROVIDERS,
     output_root: str = OUTPUT_ROOT,
 ) -> dict:
-    """Resume from the first failed/missing stage, reusing paid artifacts.
+    """New storyboard from the existing valid script; downstream regenerates.
+
+    Synchronous variant (direct calls). The HTTP API enqueues
+    run_regenerate_storyboard_bg instead so paid work never blocks a request.
 
     Provider args default to USE_REAL_PROVIDERS; pass None to skip a stage."""
     job = store.get(job_id)
     if job is None:
         raise KeyError(f"job not found: {job_id}")
-    owner = f"retry-{job_id}"
+    owner = f"regen-storyboard-{job_id}"
     if not store.acquire_lock(job_id, owner):
         raise JobConflictError("job is currently running another operation")
     try:
-        job_dir = _job_dir(output_root, job_id)
+        return _regenerate_storyboard_locked(
+            job_id,
+            store,
+            job,
+            pipeline_factory,
+            avatar_provider,
+            broll_provider,
+            compositor_fn,
+            output_root,
+        )
+    finally:
+        store.release_lock(job_id, owner)
+
+
+def run_regenerate_storyboard_bg(
+    job_id: str,
+    store,
+    owner: str,
+    pipeline_factory: Callable = default_pipeline_factory,
+    avatar_provider=USE_REAL_PROVIDERS,
+    broll_provider=USE_REAL_PROVIDERS,
+    compositor_fn: Callable = USE_REAL_PROVIDERS,
+    output_root: str = OUTPUT_ROOT,
+) -> dict:
+    """BackgroundTasks entry for storyboard regeneration. Never raises."""
+    try:
+        job = store.get(job_id)
+        if job is None:
+            return {"job_id": job_id, "status": FAILED, "error": "job not found"}
+        return _regenerate_storyboard_locked(
+            job_id,
+            store,
+            job,
+            pipeline_factory,
+            avatar_provider,
+            broll_provider,
+            compositor_fn,
+            output_root,
+        )
+    except Exception as exc:  # safety net; body already maps failures
+        try:
+            return _fail_job(
+                store, job_id, exc, job_dir=_job_dir(output_root, job_id)
+            )
+        except Exception:
+            return store.get(job_id)
+    finally:
+        store.release_lock(job_id, owner)
+
+
+def _retry_locked(
+    job_id: str,
+    store,
+    job: dict,
+    pipeline_factory: Callable = default_pipeline_factory,
+    avatar_provider=USE_REAL_PROVIDERS,
+    broll_provider=USE_REAL_PROVIDERS,
+    compositor_fn: Callable = USE_REAL_PROVIDERS,
+    output_root: str = OUTPUT_ROOT,
+) -> dict:
+    """Retry body. Lock is held by the caller; reuses paid artifacts."""
+    job_dir = _job_dir(output_root, job_id)
+    try:
         if job.get("status") == COMPLETED and _final_is_valid(job_dir):
             return job
         store.set_status(job_id, PROCESSING)
@@ -1190,7 +1326,7 @@ def retry_job(
         if script is None or storyboard is None:
             # Upstream artifacts missing/invalid — rerun the whole job so
             # paid stages are never rebuilt on top of corrupt inputs.
-            store.release_lock(job_id, owner)
+            # The caller's lock stays held (run_job takes no lock).
             return run_job(
                 job_id,
                 job["request"] or {},
@@ -1239,12 +1375,126 @@ def retry_job(
             requested_duration=request.duration_seconds,
         )
         return _finish_job(store, job_id, job_dir, summary)
-    except (JobConflictError, KeyError):
-        raise
     except Exception as exc:
         return _fail_job(store, job_id, exc, job_dir=job_dir)
+
+
+def retry_job(
+    job_id: str,
+    store,
+    pipeline_factory: Callable = default_pipeline_factory,
+    avatar_provider=USE_REAL_PROVIDERS,
+    broll_provider=USE_REAL_PROVIDERS,
+    compositor_fn: Callable = USE_REAL_PROVIDERS,
+    output_root: str = OUTPUT_ROOT,
+) -> dict:
+    """Resume from the first failed/missing stage, reusing paid artifacts.
+
+    Synchronous variant (direct calls). The HTTP API enqueues run_retry_bg
+    instead so paid work never blocks a request.
+
+    Provider args default to USE_REAL_PROVIDERS; pass None to skip a stage."""
+    job = store.get(job_id)
+    if job is None:
+        raise KeyError(f"job not found: {job_id}")
+    owner = f"retry-{job_id}"
+    if not store.acquire_lock(job_id, owner):
+        raise JobConflictError("job is currently running another operation")
+    try:
+        return _retry_locked(
+            job_id,
+            store,
+            job,
+            pipeline_factory,
+            avatar_provider,
+            broll_provider,
+            compositor_fn,
+            output_root,
+        )
     finally:
         store.release_lock(job_id, owner)
+
+
+def run_retry_bg(
+    job_id: str,
+    store,
+    owner: str,
+    pipeline_factory: Callable = default_pipeline_factory,
+    avatar_provider=USE_REAL_PROVIDERS,
+    broll_provider=USE_REAL_PROVIDERS,
+    compositor_fn: Callable = USE_REAL_PROVIDERS,
+    output_root: str = OUTPUT_ROOT,
+) -> dict:
+    """BackgroundTasks entry for retry. Never raises; lock always released."""
+    try:
+        job = store.get(job_id)
+        if job is None:
+            return {"job_id": job_id, "status": FAILED, "error": "job not found"}
+        return _retry_locked(
+            job_id,
+            store,
+            job,
+            pipeline_factory,
+            avatar_provider,
+            broll_provider,
+            compositor_fn,
+            output_root,
+        )
+    except Exception as exc:  # safety net; body already maps failures
+        try:
+            return _fail_job(
+                store, job_id, exc, job_dir=_job_dir(output_root, job_id)
+            )
+        except Exception:
+            return store.get(job_id)
+    finally:
+        store.release_lock(job_id, owner)
+
+
+def recover_stale_jobs(store, output_root: str = OUTPUT_ROOT) -> list:
+    """Mark jobs left 'processing' by a backend restart as safely failed.
+
+    Clears their locks, preserves all on-disk artifacts (voice.mp3,
+    avatar.mp4, B-roll are never deleted), and never invokes any provider.
+    The operator resumes explicitly via the existing retry mechanism.
+    Returns the recovered job ids.
+    """
+    recovered = []
+    for job in store.all_jobs():
+        if job.get("status") != PROCESSING:
+            continue
+        job_id = job["job_id"]
+        prev_stage = job.get("current_stage") or STAGE_FAILED
+        failed_stage = (
+            prev_stage if prev_stage in STAGE_ORDER else STAGE_FAILED
+        )
+        job_dir = _job_dir(output_root, job_id)
+        try:
+            completed = _completed_artifacts(job_dir)
+        except Exception:
+            completed = []
+        store.force_release_lock(job_id)
+        store.update(
+            job_id,
+            status=FAILED,
+            error=(
+                f"Backend restarted during '{prev_stage}'. Paid stages were "
+                "NOT automatically rerun. Artifacts preserved; use Retry "
+                "to resume."
+            ),
+            error_type="RestartRecovery",
+            failed_stage=failed_stage,
+            operation=None,
+            completed_artifacts=completed or None,
+            skipped_stages=_skipped_stages(failed_stage),
+            current_stage=STAGE_FAILED,
+            status_detail=(
+                f"{STAGE_DETAILS[STAGE_FAILED]} Backend restarted during "
+                f"'{prev_stage}'."
+            ),
+        )
+        recovered.append(job_id)
+    return recovered
 
 
 def _clear_partial_only(job_dir: str) -> None:

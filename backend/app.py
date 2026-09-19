@@ -1,7 +1,7 @@
 import os
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from backend import worker
 from backend.schemas import CreateVideoRequest, CreateVideoResponse, JobStatusResponse
@@ -52,7 +52,7 @@ def create_app(
     avatar_provider=USE_REAL_PROVIDERS,
     broll_provider=USE_REAL_PROVIDERS,
     compositor_fn=USE_REAL_PROVIDERS,
-    output_root: str = OUTPUT_ROOT,
+    output_root: str | None = None,
 ) -> FastAPI:
     app = FastAPI(title="AI Financial Video Generator API")
     app.state.store = store or JobStore()
@@ -60,7 +60,14 @@ def create_app(
     app.state.avatar_provider = avatar_provider
     app.state.broll_provider = broll_provider
     app.state.compositor_fn = compositor_fn
-    app.state.output_root = output_root
+    # Persistent artifact root: explicit arg wins, else $OUTPUT_DIR,
+    # else the local-development default. Layout stays <root>/<job_id>/.
+    app.state.output_root = (
+        output_root or os.getenv("OUTPUT_DIR", OUTPUT_ROOT)
+    )
+    # Startup recovery: jobs left 'processing' by a restart become safely
+    # failed (locks cleared, artifacts preserved, no provider invoked).
+    worker.recover_stale_jobs(app.state.store, app.state.output_root)
 
     def _wiring() -> dict:
         return {
@@ -79,7 +86,25 @@ def create_app(
 
     @app.post("/api/videos", response_model=CreateVideoResponse, status_code=202)
     def create_video(payload: CreateVideoRequest, background: BackgroundTasks):
-        job = app.state.store.create(payload.model_dump())
+        # Atomic idempotency + single-concurrency guard: duplicate keys
+        # return the existing job (200, no new work); a fresh request
+        # while another job is active is rejected (409, no record left).
+        job, outcome = app.state.store.create_guarded(
+            payload.model_dump(), payload.idempotency_key
+        )
+        if outcome == "duplicate":
+            return JSONResponse(
+                status_code=200,
+                content={"job_id": job["job_id"], "status": job["status"]},
+            )
+        if outcome == "busy":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Another video generation is currently running. "
+                    "Please try again later."
+                ),
+            )
         background.add_task(
             worker.run_job,
             job["job_id"],
@@ -88,6 +113,11 @@ def create_app(
             *(_wiring_kwargs(app)),
         )
         return {"job_id": job["job_id"], "status": job["status"]}
+
+    @app.get("/healthz")
+    def get_healthz():
+        """Lightweight liveness probe. Never touches providers or disk."""
+        return {"ok": True}
 
     @app.get("/api/videos/{job_id}", response_model=JobStatusResponse)
     def get_video(job_id: str):
@@ -144,51 +174,57 @@ def create_app(
         response_model=JobStatusResponse,
         status_code=202,
     )
-    def regenerate_script(job_id: str):
+    def regenerate_script(job_id: str, background: BackgroundTasks):
+        # Cheap synchronous checks only; paid OpenAI/media work runs in the
+        # background and surfaces through GET polling (never blocks here).
         job = _get_job_or_404(job_id)
         _reject_if_mutating(job)
-        try:
-            updated = worker.regenerate_script(
-                job_id, app.state.store, *(_wiring_kwargs(app))
-            )
-        except worker.RegenValidationError as exc:
+        owner = f"regen-script-{job_id}"
+        if not app.state.store.acquire_lock(job_id, owner):
             raise HTTPException(
-                status_code=422,
-                detail={
-                    "message": str(exc),
-                    "unsupported_claims": exc.unsupported_claims,
-                },
+                status_code=409,
+                detail="job is currently running another operation",
             )
-        except worker.JobConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
-        except KeyError:
-            raise HTTPException(status_code=404, detail="job not found")
-        return _job_payload(updated)
+        app.state.store.set_status(job_id, worker.PROCESSING)
+        background.add_task(
+            worker.run_regenerate_script_bg,
+            job_id,
+            app.state.store,
+            owner,
+            *(_wiring_kwargs(app)),
+        )
+        return _job_payload(app.state.store.get(job_id))
 
     @app.post(
         "/api/videos/{job_id}/storyboard/regenerate",
         response_model=JobStatusResponse,
         status_code=202,
     )
-    def regenerate_storyboard(job_id: str):
+    def regenerate_storyboard(job_id: str, background: BackgroundTasks):
         job = _get_job_or_404(job_id)
         _reject_if_mutating(job)
-        try:
-            updated = worker.regenerate_storyboard(
-                job_id, app.state.store, *(_wiring_kwargs(app))
+        owner = f"regen-storyboard-{job_id}"
+        if not app.state.store.acquire_lock(job_id, owner):
+            raise HTTPException(
+                status_code=409,
+                detail="job is currently running another operation",
             )
-        except worker.JobConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
-        except KeyError:
-            raise HTTPException(status_code=404, detail="job not found")
-        return _job_payload(updated)
+        app.state.store.set_status(job_id, worker.PROCESSING)
+        background.add_task(
+            worker.run_regenerate_storyboard_bg,
+            job_id,
+            app.state.store,
+            owner,
+            *(_wiring_kwargs(app)),
+        )
+        return _job_payload(app.state.store.get(job_id))
 
     @app.post(
         "/api/videos/{job_id}/retry",
         response_model=JobStatusResponse,
         status_code=202,
     )
-    def retry_job(job_id: str):
+    def retry_job(job_id: str, background: BackgroundTasks):
         job = _get_job_or_404(job_id)
         _reject_if_mutating(job)
         if job["status"] not in ("failed", "completed"):
@@ -196,15 +232,21 @@ def create_app(
                 status_code=409,
                 detail=f"job is {job['status']}, nothing to retry",
             )
-        try:
-            updated = worker.retry_job(
-                job_id, app.state.store, *(_wiring_kwargs(app))
+        owner = f"retry-{job_id}"
+        if not app.state.store.acquire_lock(job_id, owner):
+            raise HTTPException(
+                status_code=409,
+                detail="job is currently running another operation",
             )
-        except worker.JobConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
-        except KeyError:
-            raise HTTPException(status_code=404, detail="job not found")
-        return _job_payload(updated)
+        app.state.store.set_status(job_id, worker.PROCESSING)
+        background.add_task(
+            worker.run_retry_bg,
+            job_id,
+            app.state.store,
+            owner,
+            *(_wiring_kwargs(app)),
+        )
+        return _job_payload(app.state.store.get(job_id))
 
     return app
 

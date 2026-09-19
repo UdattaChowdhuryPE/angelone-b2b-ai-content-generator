@@ -7,6 +7,7 @@ regeneration and retry of failed stages.
 """
 
 import os
+import uuid
 
 import requests
 import streamlit as st
@@ -18,6 +19,9 @@ load_dotenv()
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 POLL_INTERVAL_S = 2
 LONG_TIMEOUT_S = 1200
+# Short timeout for mutations: regen/retry now enqueue background work and
+# return immediately; the job monitor polls for completion.
+MUTATION_TIMEOUT_S = 30
 
 STAGES = [
     ("queued", "Queued"),
@@ -43,6 +47,10 @@ def _init_state() -> None:
     st.session_state.setdefault("last_request", None)
     st.session_state.setdefault("preflight", None)
     st.session_state.setdefault("preflight_error", None)
+    # One idempotency key per Generate intent: reused across reruns/polls
+    # so a duplicate submit can never mint a second paid job. Rotated
+    # only after a successful new submission (see submit handler).
+    st.session_state.setdefault("idem_key", uuid.uuid4().hex)
 
 
 def _api_get_preflight() -> dict:
@@ -131,6 +139,8 @@ def _submit_video(payload: dict) -> dict:
     resp = requests.post(f"{BACKEND_URL}/api/videos", json=payload, timeout=30)
     if resp.status_code == 422:
         raise ValueError(_detail(resp, "Backend rejected the request (422)."))
+    if resp.status_code == 409:
+        raise ValueError(_detail(resp, "Backend is busy (409)."))
     resp.raise_for_status()
     return resp.json()
 
@@ -333,11 +343,11 @@ def _job_monitor() -> None:
 
 def _do_regen(kind: str, job_id: str) -> None:
     st.session_state["video_bytes"] = None
-    with st.spinner(f"Regenerating {kind} (this can take several minutes)…"):
+    with st.spinner("Starting regeneration…"):
         try:
             job = _api_post(
                 f"/api/videos/{job_id}/{kind}/regenerate",
-                timeout=LONG_TIMEOUT_S,
+                timeout=MUTATION_TIMEOUT_S,
             )
         except ValueError as error:
             st.error(str(error))
@@ -357,14 +367,14 @@ def _do_regen(kind: str, job_id: str) -> None:
         st.error("Regeneration failed.")
         _render_error(job)
     else:
-        st.success(f"{kind.capitalize()} regenerated — downstream video rebuilt.")
+        st.success("Regeneration started — polling…")
 
 
 def _do_retry(job_id: str) -> None:
-    with st.spinner("Retrying from the failed stage…"):
+    with st.spinner("Starting retry…"):
         try:
             job = _api_post(
-                f"/api/videos/{job_id}/retry", timeout=LONG_TIMEOUT_S
+                f"/api/videos/{job_id}/retry", timeout=MUTATION_TIMEOUT_S
             )
         except (RuntimeError, LookupError, ValueError) as error:
             st.error(str(error))
@@ -377,7 +387,7 @@ def _do_retry(job_id: str) -> None:
         st.error("Retry failed again.")
         _render_error(job)
     else:
-        st.success("Retry completed.")
+        st.success("Retry started — polling…")
 
 
 def _fetch_video_bytes(job_id: str) -> None:
@@ -465,6 +475,7 @@ if submitted and not st.session_state["busy"]:
         "key_message": key_message.strip(),
         "language": language,
         "duration_seconds": duration,
+        "idempotency_key": st.session_state["idem_key"],
     }
     st.session_state["busy"] = True
     st.session_state["video_bytes"] = None
@@ -484,6 +495,9 @@ if submitted and not st.session_state["busy"]:
     st.session_state["job_id"] = created["job_id"]
     st.session_state["last_request"] = payload
     st.session_state["busy"] = False
+    # Fresh key for the next Generate intent; the used key stays mapped
+    # server-side for 24h so a repeated submit returns the same job.
+    st.session_state["idem_key"] = uuid.uuid4().hex
     st.caption(f"Job `{created['job_id']}` submitted.")
 
 _job_monitor()

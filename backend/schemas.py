@@ -1,11 +1,17 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator
 
 
 class CreateVideoRequest(BaseModel):
-    topic: str = Field(min_length=1)
-    key_message: str = Field(min_length=1)
-    language: str = "English"
-    duration_seconds: int = Field(default=60, gt=0, le=300)
+    topic: str = Field(min_length=1, max_length=500)
+    key_message: str = Field(min_length=1, max_length=5000)
+    language: Literal["English", "Hinglish", "Hindi"] = "English"
+    duration_seconds: Literal[30, 45, 60]
+    # Opaque client-generated token (one per Generate intent). Used to
+    # deduplicate double-clicks/refreshes/retries so a duplicate request
+    # can never mint a second paid job. Length-bounded only (not UUID).
+    idempotency_key: str | None = Field(default=None, min_length=16, max_length=64)
 
     @field_validator("topic", "key_message")
     @classmethod

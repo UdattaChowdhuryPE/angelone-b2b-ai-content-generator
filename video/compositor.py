@@ -15,6 +15,11 @@ FINAL_WIDTH = 1080
 FINAL_HEIGHT = 1920
 FINAL_FPS = 30
 
+#: Bound for the full final assembly render (single-shot, never retried).
+FFMPEG_TIMEOUT_S = 600
+#: Bound for media probing/validation. Failing fast beats hanging the worker.
+FFPROBE_TIMEOUT_S = 60
+
 
 class CompositorError(RuntimeError):
     """Raised when FFmpeg assembly fails. Never mark the job completed."""
@@ -56,27 +61,35 @@ def render_vertical_video(
     subprocess.run(
         command,
         check=True,
+        timeout=FFMPEG_TIMEOUT_S,
     )
 
     return output_path
 
 
-def probe_media(path: str) -> dict:
-    out = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            path,
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+def probe_media(path: str, timeout: int = FFPROBE_TIMEOUT_S) -> dict:
+    try:
+        out = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                path,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise Mp4ValidationError(
+            f"ffprobe timed out after {timeout}s for {path} — "
+            "refusing to hang the worker"
+        ) from exc
     return json.loads(out.stdout)
 
 
@@ -379,7 +392,16 @@ def compose_final(
         os.makedirs(parent, exist_ok=True)
     partial = output_path + ".partial"
     try:
-        subprocess.run(cmd + [partial], check=True)
+        subprocess.run(cmd + [partial], check=True, timeout=FFMPEG_TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            if os.path.exists(partial):
+                os.remove(partial)
+        finally:
+            raise CompositorError(
+                f"FFmpeg assembly timed out after {FFMPEG_TIMEOUT_S}s; "
+                "job is NOT marked completed."
+            ) from exc
     except subprocess.CalledProcessError as exc:
         try:
             if os.path.exists(partial):
