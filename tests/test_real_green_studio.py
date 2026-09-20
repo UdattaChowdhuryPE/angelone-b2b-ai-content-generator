@@ -307,7 +307,7 @@ def test_controlled_request_matches_legacy_real_test():
     assert "Market volatility is normal" in req["key_message"]
 
 
-def test_worker_production_default_is_full_scene():
+def test_worker_production_default_is_full_scene(monkeypatch):
     """Non-paid: worker defaults wire the full_scene production path.
 
     Architecture change (controlled Photo Avatar experiment): the
@@ -318,6 +318,9 @@ def test_worker_production_default_is_full_scene():
     generate_green), and default_avatar_provider() is a
     FullSceneAvatarProvider (a HeyGenAvatarProvider whose generate()
     is the no-background full-scene render).
+
+    The provider is instantiated with clearly-fake credential env vars
+    (no real secrets, no network) purely to assert the wiring type.
     """
     import backend.worker as worker_mod
     from providers.heygen import FullSceneAvatarProvider, HeyGenAvatarProvider
@@ -326,6 +329,8 @@ def test_worker_production_default_is_full_scene():
     assert 'avatar_mode="full_scene"' in src
     assert "studio_background_path" not in src
     assert "generate_green" not in src
+    monkeypatch.setenv("HEYGEN_API_KEY", "test-heygen-key")
+    monkeypatch.setenv("HEYGEN_AVATAR_ID", "test-photo-avatar-id")
     provider = worker_mod.default_avatar_provider()
     assert isinstance(provider, FullSceneAvatarProvider)
     assert isinstance(provider, HeyGenAvatarProvider)
