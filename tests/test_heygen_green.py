@@ -33,7 +33,13 @@ def test_green_background_payload_shape():
         HeyGenAvatarProvider.green_background("#FFF")
 
 
-def test_create_video_green_payload_has_no_matting(tmp_path):
+def test_create_video_green_payload_mattes_onto_color():
+    """Green payload carries color background WITH remove_background.
+
+    Regression cover for the first paid probe: background color sent
+    WITHOUT remove_background was silently ignored by the server
+    (near-white render), repeating the V0.9 image-background lesson.
+    """
     provider = _make_provider()
     mock_response = MagicMock()
     mock_response.json.return_value = {"data": {"video_id": "vid_g"}}
@@ -44,7 +50,7 @@ def test_create_video_green_payload_has_no_matting(tmp_path):
     payload = mock_post.call_args[1]["json"]
     assert payload["fit"] == "cover"
     assert payload["background"] == green
-    assert "remove_background" not in payload  # local chromakey does matting
+    assert payload["remove_background"] is True  # required, else white
     assert payload["engine"] == {"type": "avatar_iv"}
 
 

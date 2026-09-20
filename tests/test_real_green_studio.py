@@ -11,7 +11,8 @@ Scope (exactly one controlled paid run when armed):
   - real ElevenLabs voice (existing stage, unchanged)
   - real HeyGen GREEN-SCREEN avatar via a test-local worker-compatible
     adapter delegating to HeyGenAvatarProvider.generate_green()
-  - broll_provider=None (Higgsfield skipped for this controlled test)
+  - broll_provider=LocalBrollProvider (deterministic local lavfi clips;
+    Higgsfield skipped for this controlled test)
   - real local studio composition: compose_final() with
     avatar_mode="green" over the canonical production background
     assets/backgrounds/studio_background.png (desk foreground + captions)
@@ -120,6 +121,48 @@ def green_studio_compositor_fn(
     )
 
 
+class LocalBrollProvider:
+    """Test-local deterministic B-roll (zero Higgsfield spend).
+
+    fetch(storyboard, job_dir) renders one silent 720x1280 H.264 lavfi
+    clip per broll_required scene, sized to cover that scene's window,
+    and returns {scene_id: clip_path} (the dict form worker validation
+    and the compositor accept directly). Keeps the approved storyboard
+    byte-identical — flags are never cleared. B-roll windows render as
+    flat cutaways; the avatar scenes carry the green-studio validation.
+    Used ONLY by the paid green E2E in this file.
+    """
+
+    COLOR = "navy"
+
+    def fetch(self, storyboard, job_dir: str) -> dict:
+        import subprocess
+
+        from video.storyboard import get_broll_scenes
+
+        clips: dict = {}
+        bdir = os.path.join(job_dir, "broll")
+        os.makedirs(bdir, exist_ok=True)
+        for scene in get_broll_scenes(storyboard):
+            window = float(scene.end) - float(scene.start)
+            duration = round(max(window, 0.0) + 1.0, 2)
+            path = os.path.join(bdir, f"local_s{scene.scene_id}.mp4")
+            subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-f", "lavfi", "-i",
+                    f"color=size=720x1280:rate=30:color={self.COLOR}"
+                    f":duration={duration:.2f}",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-an", path,
+                ],
+                check=True,
+                capture_output=True,
+            )
+            clips[scene.scene_id] = path
+        return clips
+
+
 def _controlled_request() -> dict:
     """Existing 30-second controlled request (same body as test_real_video)."""
     return {
@@ -156,7 +199,7 @@ def test_real_green_studio_end_to_end(tmp_path):
         request,
         store,
         avatar_provider=GreenScreenAvatarAdapter(),
-        broll_provider=None,
+        broll_provider=LocalBrollProvider(),
         compositor_fn=green_studio_compositor_fn,
         output_root=str(tmp_path),
     )
@@ -187,14 +230,14 @@ def test_real_green_studio_end_to_end(tmp_path):
         "duration": float(info["format"]["duration"]),
         "caption_pngs": len(captions),
         "desk_foreground": desk,
-        "broll_skipped": True,
+        "broll_source": "local-lavfi (Higgsfield skipped)",
         "result": final.get("result"),
     }
     print(json.dumps(
         {k: report[k] for k in (
             "job_id", "status", "artifact_path", "resolution",
             "duration", "caption_pngs", "desk_foreground",
-            "broll_skipped",
+            "broll_source",
         )},
         indent=2,
     ))
@@ -233,6 +276,27 @@ def test_green_compositor_wires_studio_mode():
     kwargs = mock.call_args[1]
     assert kwargs["avatar_mode"] == "green"
     assert kwargs["studio_background_path"] == CANONICAL_STUDIO_BACKGROUND
+
+
+def test_local_broll_provider_maps_required_scenes(tmp_path):
+    """Non-paid: local provider covers every broll_required scene (mocked)."""
+    import subprocess as subprocess_mod
+
+    from tests.fakes import make_storyboard
+
+    board = make_storyboard()
+    board.scenes[1].broll_required = True
+    board.scenes[1].visual_prompt = "clip two"
+
+    def fake_run(cmd, **kwargs):
+        with open(cmd[-1], "wb") as f:
+            f.write(b"clipbytes")
+        return MagicMock()
+
+    with patch.object(subprocess_mod, "run", side_effect=fake_run):
+        clips = LocalBrollProvider().fetch(board, str(tmp_path))
+    assert set(clips) == {2}
+    assert clips[2].endswith("local_s2.mp4")
 
 
 def test_controlled_request_matches_legacy_real_test():

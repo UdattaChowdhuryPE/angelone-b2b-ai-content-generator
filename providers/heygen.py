@@ -105,7 +105,9 @@ class HeyGenAvatarProvider:
     #: studio BG -> presenter -> desk foreground -> captions.
     #: HeyGen CreateVideoFromAvatar supports background {color|image} on
     #: the Avatar IV path; color uses {"type": "color", "value": "#RRGGBB"}
-    #: and must NOT set remove_background (matting is done locally).
+    #: WITH remove_background=True (without it the server silently
+    #: ignores the color and renders near-white). Local FFmpeg chromakey
+    #: then keys the solid green.
     GREEN_SCREEN_HEX = "#00FF00"
     GREEN_SCREEN_ENGINE = {"type": "avatar_iv"}
 
@@ -197,7 +199,15 @@ class HeyGenAvatarProvider:
             }
             payload["remove_background"] = True
         elif background is not None:
-            # Green-screen path: solid color, no server-side matting.
+            # Green-screen path: solid color WITH server-side matting.
+            # remove_background=True is REQUIRED — without it the server
+            # silently ignores the color background and renders its
+            # default near-white backdrop instead (proven by the first
+            # paid green probe: corners sampled (253,253,253)). This
+            # mirrors the proven image path (V0.9 ignored background
+            # alone; V0.11 applied it with remove_background=True):
+            # matte the avatar, composite onto the requested color.
+            # Local FFmpeg chromakey then keys the solid green.
             if not isinstance(background, dict) or background.get("type") != "color":
                 raise ValueError(
                     "Green-screen background must be "
@@ -206,6 +216,7 @@ class HeyGenAvatarProvider:
                 )
             payload["fit"] = "cover"
             payload["background"] = dict(background)
+            payload["remove_background"] = True
         response = requests.post(
             f"{self.BASE_URL}/v3/videos",
             headers={**self.headers, "Content-Type": "application/json"},
@@ -384,11 +395,14 @@ class HeyGenAvatarProvider:
 
         Future-render path for the local studio composite. Uploads ONLY
         the narration audio, creates the avatar video (Avatar IV, 9:16,
-        720p) over a solid green background with NO server-side matting,
+        720p) matted onto a solid green background (remove_background=True
+        — required, otherwise the server silently renders near-white),
         waits for completion, downloads the MP4. The local compositor
         (video/compositor.py studio path) chromakeys green and composites:
         canonical studio BG -> presenter -> desk foreground -> captions.
-        API errors propagate — never swallowed, never faked.
+        API errors propagate — never swallowed, never faked. The HeyGen
+        video_id and final status are printed (no secrets) so paid runs
+        leave an audit trail.
         """
         if not os.path.exists(audio_path):
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
@@ -405,8 +419,13 @@ class HeyGenAvatarProvider:
             raise RuntimeError(
                 f"HeyGen create returned no video_id: {created}"
             )
+        print(f"heygen green render: video_id={video_id}")
         final = self.wait_for_result(
             video_id, poll_interval=poll_interval, timeout=timeout
+        )
+        print(
+            "heygen green render: final status="
+            f"{final.get('data', {}).get('status')}"
         )
         data = final.get("data", {})
         video_url = data.get("video_url") or data.get("url")
