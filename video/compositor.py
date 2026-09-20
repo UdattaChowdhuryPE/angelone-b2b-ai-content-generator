@@ -15,6 +15,42 @@ FINAL_WIDTH = 1080
 FINAL_HEIGHT = 1920
 FINAL_FPS = 30
 
+#: ---------------------------------------------------------------------------
+#: Studio composition geometry (green-screen future-render path).
+#: ALL tunable numbers live here — never scatter magic numbers through the
+#: filter graph. Tuned against the deterministic local fixture to meet:
+#: centered presenter, 380-490px wide, head/shoulders upper-middle, studio
+#: branding visible above/beside, desk foreground from ~60-62% height with
+#: the lower presenter body fully occluded, no rectangular/halo artifacts.
+#: The attached visual reference is target-only and is NEVER loaded here;
+#: ---------------------------------------------------------------------------
+#: Canonical AngelOne studio background (portrait 9:16, desk included).
+STUDIO_BACKGROUND_PATH = "assets/backgrounds/studio_background.png"
+#: Presenter overlay size for the 720x1280 HeyGen green-screen source.
+#: 0.61 -> 439x781 frame; overlay width sits mid-band of the 380-490px
+#: acceptance target (keyed transparency means no baked-BG rectangle).
+STUDIO_AVATAR_SCALE = 0.61
+STUDIO_AVATAR_WIDTH_PX = 439
+STUDIO_AVATAR_HEIGHT_PX = 781
+#: Centered: (1080 - 439) // 2. Keeps equal studio margins left/right.
+STUDIO_AVATAR_X_PX = 320
+#: Top offset tuned so the head sits upper-middle (studio + signage clear
+#: above) while the overlay bottom (560 + 781 = 1341) extends ~170px below
+#: the desk line (1171) and is occluded by the desk foreground.
+STUDIO_AVATAR_TOP_PX = 560
+#: Desk foreground: bottom strip of the canonical BG, fraction of 1920.
+#: 0.61 -> top y=1171, height=749. Matches the reference desk-surface line.
+STUDIO_DESK_TOP_FRAC = 0.61
+STUDIO_DESK_TOP_PX = 1171
+STUDIO_DESK_HEIGHT_PX = 749
+#: Feathered alpha gradient over the top rows of the desk strip so the
+#: presenter-to-desk transition never renders a hard rectangular edge.
+STUDIO_DESK_FEATHER_PX = 12
+#: FFmpeg chromakey tuning for HeyGen solid-green (#00FF00) renders.
+STUDIO_CHROMAKEY_COLOR = "0x00FF00"
+STUDIO_CHROMAKEY_SIMILARITY = 0.12
+STUDIO_CHROMAKEY_BLEND = 0.15
+
 #: Bound for the full final assembly render (single-shot, never retried).
 FFMPEG_TIMEOUT_S = 600
 #: Bound for media probing/validation. Failing fast beats hanging the worker.
@@ -121,6 +157,85 @@ def _avatar_norm_filter() -> str:
         f"crop={FINAL_WIDTH}:{FINAL_HEIGHT},"
         "format=yuv420p,setdar=9/16"
     )
+
+
+def _studio_chromakey_filter() -> str:
+    """Keyed-presenter normalization for the green-screen studio path.
+
+    Scales the HeyGen green-screen frame to the configured overlay size,
+    removes solid green, and emits yuva420p so the transparent surround
+    never renders a rectangular box over the studio.
+    """
+    return (
+        f"fps={FINAL_FPS},"
+        f"scale={STUDIO_AVATAR_WIDTH_PX}:{STUDIO_AVATAR_HEIGHT_PX},"
+        f"chromakey={STUDIO_CHROMAKEY_COLOR}:"
+        f"{STUDIO_CHROMAKEY_SIMILARITY}:{STUDIO_CHROMAKEY_BLEND},"
+        "format=yuva420p"
+    )
+
+
+def _studio_bg_filter() -> str:
+    """Full-frame canonical studio base: cover to exactly 1080x1920."""
+    return (
+        f"fps={FINAL_FPS},"
+        f"scale={FINAL_WIDTH}:{FINAL_HEIGHT}:"
+        "force_original_aspect_ratio=increase,"
+        f"crop={FINAL_WIDTH}:{FINAL_HEIGHT},"
+        "format=yuv420p,setdar=9/16"
+    )
+
+
+def build_desk_foreground(
+    background_path: str,
+    output_path: str,
+) -> str:
+    """Crop the desk strip from the canonical BG as an RGBA foreground.
+
+    Uses the SAME cover math as the FFmpeg bg base (proportional cover to
+    1080x1920 + center crop) so desk pixels align exactly with the base.
+    The top STUDIO_DESK_FEATHER_PX rows fade 0->opaque to avoid a hard
+    rectangular transition where the desk meets the presenter. The
+    canonical file is only read — never modified. Returns output_path.
+    """
+    from PIL import Image
+
+    if not background_path or not os.path.exists(background_path):
+        raise CompositorError(
+            f"Studio background missing: {background_path}"
+        )
+    img = Image.open(background_path).convert("RGB")
+    width, height = img.size
+    if width <= 0 or height <= 0:
+        raise CompositorError(
+            f"Invalid studio background dimensions: {width}x{height}"
+        )
+    import math
+
+    factor = max(FINAL_WIDTH / width, FINAL_HEIGHT / height)
+    scaled = img.resize(
+        (max(1, math.ceil(width * factor)), max(1, math.ceil(height * factor))),
+        Image.LANCZOS,
+    )
+    left = (scaled.width - FINAL_WIDTH) // 2
+    top_crop = (scaled.height - FINAL_HEIGHT) // 2
+    full = scaled.crop((left, top_crop, left + FINAL_WIDTH, top_crop + FINAL_HEIGHT))
+    desk = full.crop(
+        (0, STUDIO_DESK_TOP_PX, FINAL_WIDTH, FINAL_HEIGHT)
+    ).convert("RGBA")
+    # Feathered top edge: gradient alpha over the first FEATHER rows.
+    feather = max(1, int(STUDIO_DESK_FEATHER_PX))
+    px = desk.load()
+    for y in range(min(feather, desk.height)):
+        alpha = int(255 * (y + 1) / feather)
+        for x in range(desk.width):
+            r, g, b, _ = px[x, y]
+            px[x, y] = (r, g, b, alpha)
+    parent = os.path.dirname(output_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    desk.save(output_path)
+    return output_path
 
 
 def validate_mp4(
@@ -233,13 +348,26 @@ def compose_final(
     job_dir: str | None = None,
     font_path: str | None = None,
     script_text: str | None = None,
+    studio_background_path: str | None = None,
+    avatar_mode: str = "auto",
 ) -> str:
     """Assemble the complete final video: avatar + B-roll + captions.
 
-    - Video base: per-scene segments from the storyboard. Scenes with an
-      available B-roll clip show B-roll (video-only); all other scenes show
-      the avatar. Segments are normalized to 1080x1920/30fps/yuv420p and
-      concatenated with hard cuts (proven V0.7/V0.9 pattern).
+    Two avatar paths (legacy preserved byte-for-byte in filter shape):
+
+    - legacy (default when studio_background_path is None): per-scene
+      segments show the HeyGen studio-BAKED avatar full-bleed via
+      _avatar_norm_filter(); B-roll shows full-frame. Proven V0.7/V0.9
+      pattern for all existing/old renders.
+    - studio (green-screen future renders): pass studio_background_path
+      (canonical AngelOne PNG) with avatar_mode="green" (or "auto" with
+      the path set). The HeyGen green-screen presenter is chromakeyed
+      locally and composited: full-frame studio BG -> scaled centered
+      presenter (STUDIO_AVATAR_* geometry) -> desk foreground strip
+      (occludes lower body) -> captions. B-roll scenes stay full-frame
+      cutaways. avatar_mode="legacy" forces the legacy path even when a
+      background path is given.
+
     - Audio: continuous from the avatar render (B-roll audio never mapped);
       falls back to audio_path (ElevenLabs voice) when the avatar has no
       audio stream. Narration is never lost.
@@ -250,6 +378,10 @@ def compose_final(
 
     Returns output_path. Raises CompositorError / Mp4ValidationError.
     """
+    if avatar_mode not in ("auto", "green", "legacy"):
+        raise CompositorError(
+            f"avatar_mode must be auto/green/legacy, got {avatar_mode!r}."
+        )
     if not avatar_path or not os.path.exists(avatar_path):
         raise CompositorError(f"Avatar video missing: {avatar_path}")
     scenes = list(getattr(storyboard, "scenes", []) or [])
@@ -309,8 +441,29 @@ def compose_final(
         if clip not in clip_order:
             clip_order.append(clip)
 
+    work_dir = job_dir or os.path.dirname(output_path) or "."
+    if avatar_mode == "green":
+        if not studio_background_path or not os.path.exists(
+            studio_background_path
+        ):
+            raise CompositorError(
+                "Studio path requires an existing studio_background_path; "
+                f"got {studio_background_path!r}."
+            )
+        use_studio = True
+    elif avatar_mode == "legacy":
+        use_studio = False
+    else:  # auto: studio only when a real background file is passed.
+        use_studio = bool(
+            studio_background_path
+            and os.path.exists(studio_background_path)
+        )
+    bg_source_path = studio_background_path if use_studio else None
+
     norm = _norm_filter()
     avatar_norm = _avatar_norm_filter()
+    keyed_norm = _studio_chromakey_filter()
+    bg_norm = _studio_bg_filter()
     inputs = [avatar_path]
     clip_index: dict[str, int] = {}
     for clip in clip_order:
@@ -318,8 +471,37 @@ def compose_final(
             clip_index[clip] = len(inputs)
             inputs.append(clip)
 
+    desk_fg_path: str | None = None
+    bg_index: int | None = None
+    desk_index: int | None = None
+    if use_studio:
+        assert bg_source_path is not None
+        desk_fg_path = build_desk_foreground(
+            bg_source_path, os.path.join(work_dir, "desk_foreground.png")
+        )
+        bg_index = len(inputs)
+        inputs.append(bg_source_path)
+        desk_index = len(inputs)
+        inputs.append(desk_fg_path)
+
     parts: list[str] = []
     labels: list[str] = []
+    avatar_segs = [
+        seg for seg, scene in enumerate(scenes)
+        if not getattr(scene, "broll_required", False)
+    ]
+    if use_studio and avatar_segs:
+        # Fan the static BG + desk foreground out to one branch per
+        # avatar scene so each segment can trim independently.
+        bg_branches = "".join(f"[bgc{i}]" for i in range(len(avatar_segs)))
+        desk_branches = "".join(f"[dskc{i}]" for i in range(len(avatar_segs)))
+        parts.append(
+            f"[{bg_index}:v]{bg_norm},split={len(avatar_segs)}{bg_branches}"
+        )
+        parts.append(
+            f"[{desk_index}:v]format=yuva420p,"
+            f"split={len(avatar_segs)}{desk_branches}"
+        )
     for seg, scene in enumerate(scenes):
         start, end = float(scene.start), float(scene.end)
         if getattr(scene, "broll_required", False):
@@ -329,7 +511,7 @@ def compose_final(
                 f"[{ci}:v]trim=start=0:end={end - start},"
                 f"setpts=PTS-STARTPTS,{norm}[s{seg}]"
             )
-        else:
+        elif not use_studio:
             end = min(end, avatar_duration) if avatar_duration > 0 else end
             if end <= start:
                 raise CompositorError(
@@ -341,16 +523,50 @@ def compose_final(
                 f"[0:v]trim=start={start}:end={end},"
                 f"setpts=PTS-STARTPTS,{avatar_norm}[s{seg}]"
             )
+        else:
+            end = min(end, avatar_duration) if avatar_duration > 0 else end
+            if end <= start:
+                raise CompositorError(
+                    f"Scene {scene.scene_id} window [{start}, {end}] "
+                    "is outside the avatar duration "
+                    f"{avatar_duration:.2f}s."
+                )
+            ai = avatar_segs.index(seg)
+            seg_len = end - start
+            # Layer order per avatar scene (conceptual z):
+            #   studio BG -> keyed presenter -> desk foreground.
+            parts.append(
+                f"[bgc{ai}]trim=start={start}:end={end},"
+                f"setpts=PTS-STARTPTS[bg{seg}]"
+            )
+            parts.append(
+                f"[0:v]trim=start={start}:end={end},"
+                f"setpts=PTS-STARTPTS,{keyed_norm}[ak{seg}]"
+            )
+            parts.append(
+                f"[bg{seg}][ak{seg}]overlay="
+                f"{STUDIO_AVATAR_X_PX}:{STUDIO_AVATAR_TOP_PX}:"
+                f"eof_action=pass:format=yuv420[st{seg}]"
+            )
+            parts.append(
+                f"[dskc{ai}]trim=start=0:end={seg_len},"
+                f"setpts=PTS-STARTPTS[dsk{seg}]"
+            )
+            parts.append(
+                f"[st{seg}][dsk{seg}]overlay=0:{STUDIO_DESK_TOP_PX}:"
+                f"eof_action=pass:format=yuv420[s{seg}]"
+            )
         labels.append(f"[s{seg}]")
     parts.append(f"{''.join(labels)}concat=n={len(labels)}:v=1:a=0[vbase]")
 
     # Captions last (FINAL layer over the assembled base).
     cards = split_cards(full_script)
     segments = time_cards(cards, total_duration)
-    work_dir = job_dir or os.path.dirname(output_path) or "."
     cap_dir = os.path.join(work_dir, "captions")
     cap_paths = render_all_cards(segments, cap_dir, font_path=font_path)
-    first_cap_input = len(inputs)
+    # Caption input indices must account for the optional fallback audio
+    # input appended below (avatar+broll[+bg+desk][+audio] -> caps).
+    first_cap_input = len(inputs) + (0 if use_avatar_audio else 1)
     current = "vbase"
     for i, segment in enumerate(segments):
         nxt = f"cap{i}"
@@ -364,6 +580,16 @@ def compose_final(
     cmd = ["ffmpeg", "-y", "-i", avatar_path]
     for clip in clip_order:
         cmd += ["-i", clip]
+    if use_studio:
+        assert bg_source_path is not None and desk_fg_path is not None
+        cmd += [
+            "-loop", "1", "-framerate", str(FINAL_FPS),
+            "-t", f"{total_duration + 1:.2f}", "-i", bg_source_path,
+        ]
+        cmd += [
+            "-loop", "1", "-framerate", str(FINAL_FPS),
+            "-t", f"{total_duration + 1:.2f}", "-i", desk_fg_path,
+        ]
     fallback_audio_index: int | None = None
     if not use_avatar_audio:
         fallback_audio_index = len(inputs)

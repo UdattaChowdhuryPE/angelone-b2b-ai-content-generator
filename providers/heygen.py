@@ -100,6 +100,15 @@ class HeyGenAvatarProvider:
     SOURCE_RESOLUTION = "720p"
     SOURCE_ASPECT_RATIO = "9:16"
 
+    #: Green-screen future-render path. A solid green background lets the
+    #: local compositor chromakey the presenter and composite:
+    #: studio BG -> presenter -> desk foreground -> captions.
+    #: HeyGen CreateVideoFromAvatar supports background {color|image} on
+    #: the Avatar IV path; color uses {"type": "color", "value": "#RRGGBB"}
+    #: and must NOT set remove_background (matting is done locally).
+    GREEN_SCREEN_HEX = "#00FF00"
+    GREEN_SCREEN_ENGINE = {"type": "avatar_iv"}
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -153,10 +162,22 @@ class HeyGenAvatarProvider:
         resolution: str = "720p",
         engine: dict | None = None,
         background_asset_id: str | None = None,
+        background: dict | None = None,
     ) -> dict:
         # Production engine is Avatar IV on the configured avatar.
-        # fit=cover keeps the 9:16 frame full-bleed; remove_background
-        # mattes the avatar over the canonical studio PNG.
+        # Two background modes (never combined):
+        # - studio-baked (legacy): background_asset_id -> fit=cover +
+        #   background={type:image} + remove_background=True. Presenter is
+        #   matted over the canonical studio PNG by HeyGen; the local
+        #   compositor shows it full-bleed via _avatar_norm_filter().
+        # - green-screen (future): background={type:color,value:#00FF00}
+        #   with NO remove_background. The local compositor chromakeys the
+        #   presenter and composites studio -> presenter -> desk -> captions.
+        if background is not None and background_asset_id is not None:
+            raise ValueError(
+                "Pass either background (color dict) or "
+                "background_asset_id (image), never both."
+            )
         payload = {
             "type": "avatar",
             "avatar_id": self.avatar_id,
@@ -175,6 +196,16 @@ class HeyGenAvatarProvider:
                 "asset_id": background_asset_id,
             }
             payload["remove_background"] = True
+        elif background is not None:
+            # Green-screen path: solid color, no server-side matting.
+            if not isinstance(background, dict) or background.get("type") != "color":
+                raise ValueError(
+                    "Green-screen background must be "
+                    '{"type": "color", "value": "#RRGGBB"}; '
+                    f"got {background!r}."
+                )
+            payload["fit"] = "cover"
+            payload["background"] = dict(background)
         response = requests.post(
             f"{self.BASE_URL}/v3/videos",
             headers={**self.headers, "Content-Type": "application/json"},
@@ -310,6 +341,64 @@ class HeyGenAvatarProvider:
         created = self.create_video(
             audio_asset_id,
             background_asset_id=bg_asset_id,
+        )
+        video_id = created.get("data", {}).get("video_id")
+        if not video_id:
+            raise RuntimeError(
+                f"HeyGen create returned no video_id: {created}"
+            )
+        final = self.wait_for_result(
+            video_id, poll_interval=poll_interval, timeout=timeout
+        )
+        data = final.get("data", {})
+        video_url = data.get("video_url") or data.get("url")
+        if not video_url:
+            raise RuntimeError(
+                f"HeyGen completed with no video_url: {final}"
+            )
+        return self.download_video(video_url, output_path)
+
+    @classmethod
+    def green_background(cls, hex_color: str | None = None) -> dict:
+        """Solid-color background payload for the green-screen path."""
+        value = hex_color or cls.GREEN_SCREEN_HEX
+        if (
+            not isinstance(value, str)
+            or not value.startswith("#")
+            or len(value) != 7
+        ):
+            raise ValueError(
+                "Green-screen color must look like '#00FF00'; "
+                f"got {value!r}."
+            )
+        return {"type": "color", "value": value}
+
+    def generate_green(
+        self,
+        audio_path: str,
+        output_path: str,
+        poll_interval: int = 10,
+        timeout: int = 600,
+    ) -> str:
+        """Worker-compatible avatar render: audio -> green-screen MP4.
+
+        Future-render path for the local studio composite. Uploads ONLY
+        the narration audio, creates the avatar video (Avatar IV, 9:16,
+        720p) over a solid green background with NO server-side matting,
+        waits for completion, downloads the MP4. The local compositor
+        (video/compositor.py studio path) chromakeys green and composites:
+        canonical studio BG -> presenter -> desk foreground -> captions.
+        API errors propagate — never swallowed, never faked.
+        """
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        parent = os.path.dirname(output_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        audio_asset_id = self.upload_audio(audio_path)
+        created = self.create_video(
+            audio_asset_id,
+            background=self.green_background(),
         )
         video_id = created.get("data", {}).get("video_id")
         if not video_id:
