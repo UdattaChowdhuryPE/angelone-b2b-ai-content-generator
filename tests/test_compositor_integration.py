@@ -236,7 +236,8 @@ def test_studio_green_composite_matches_acceptance_targets(tmp_path):
         assert _close(fr.load()[980, 800], bg.load()[980, 800])
         # 3. Presenter materially present, centered, smaller than full-bleed
         # (sampled inside the synthetic torso block: source box
-        # x=180-540,y=400-1040 mapped through the 0.61 overlay at 320,560).
+        # x=180-540,y=400-1040 mapped through the overlay at 320,475
+        # with scale 439/720).
         assert not _close(fr.load()[540, 950], bg.load()[540, 950])
         # 4. Desk foreground occludes lower body (matches canonical desk).
         assert _close(

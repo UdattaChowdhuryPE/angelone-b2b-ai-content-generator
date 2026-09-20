@@ -118,19 +118,24 @@ def _run_compose(tmp_path, bg_path=None, avatar_mode="auto", board=None):
 
 
 def test_geometry_config_block_meets_acceptance_targets():
-    # Presenter width band 380-490px in the 1080px frame.
+    # Presenter width band 380-490px in the 1080px frame (size frozen).
     assert 380 <= STUDIO_AVATAR_WIDTH_PX <= 490
     # Centered horizontally.
     assert STUDIO_AVATAR_X_PX == (FINAL_WIDTH - STUDIO_AVATAR_WIDTH_PX) // 2
-    # Head upper-middle: top well below the top signage zone but above mid.
-    assert 400 <= STUDIO_AVATAR_TOP_PX <= 750
-    # Desk begins around 60-62% of frame height.
-    assert 0.60 <= STUDIO_DESK_TOP_FRAC <= 0.62
+    # Head begins around 24-27% of frame height (reference: seated
+    # presenter, shoulders + upper torso visible above the desk).
+    assert 455 <= STUDIO_AVATAR_TOP_PX <= 500
+    assert 0.24 * FINAL_HEIGHT <= STUDIO_AVATAR_TOP_PX <= 0.27 * FINAL_HEIGHT
+    # Desk top begins around 51-53% of frame height (reference tabletop).
+    assert 0.51 <= STUDIO_DESK_TOP_FRAC <= 0.532
     assert STUDIO_DESK_TOP_PX == int(round(FINAL_HEIGHT * STUDIO_DESK_TOP_FRAC))
+    assert STUDIO_DESK_TOP_PX == 1020
     assert STUDIO_DESK_HEIGHT_PX == FINAL_HEIGHT - STUDIO_DESK_TOP_PX
-    # Overlay bottom must extend below the desk line (occlusion overlap).
+    # Overlay bottom must extend below the desk line (occlusion overlap)
+    # so the lower torso disappears naturally behind the desk.
     bottom = STUDIO_AVATAR_TOP_PX + 781  # STUDIO_AVATAR_HEIGHT_PX
     assert bottom > STUDIO_DESK_TOP_PX
+    assert bottom - STUDIO_DESK_TOP_PX >= 200
     assert STUDIO_DESK_FEATHER_PX >= 8
 
 
@@ -161,6 +166,10 @@ def test_studio_path_graph_order_and_inputs(tmp_path):
     joined = " ".join(cmd)
     # Keyed presenter at configured geometry.
     assert "chromakey=0x00FF00" in joined
+    # Despill immediately after chromakey, before yuva420p (fringe cleanup;
+    # exact chain order is pinned by test_key_chain_order_and_frozen_key_values).
+    assert "despill=type=green:mix=0.5" in joined
+    assert joined.index("chromakey") < joined.index("despill")
     assert f"scale={STUDIO_AVATAR_WIDTH_PX}:" in joined
     assert f"overlay={STUDIO_AVATAR_X_PX}:{STUDIO_AVATAR_TOP_PX}" in joined
     # Desk foreground after avatar, before captions.
@@ -186,6 +195,26 @@ def test_studio_path_graph_order_and_inputs(tmp_path):
         bottom_alpha = d.load()[d.width // 2, d.height - 1][3]
         assert top_alpha < 255  # feathered edge, no hard rectangle
         assert bottom_alpha == 255
+
+
+def test_key_chain_order_and_frozen_key_values():
+    """Pin the approved tuning: key values frozen, despill after key."""
+    from video.compositor import (
+        STUDIO_CHROMAKEY_BLEND,
+        STUDIO_CHROMAKEY_SIMILARITY,
+        STUDIO_DESPILL,
+        _studio_chromakey_filter,
+    )
+
+    assert (STUDIO_CHROMAKEY_SIMILARITY, STUDIO_CHROMAKEY_BLEND) == (0.12, 0.15)
+    assert STUDIO_DESPILL == "despill=type=green:mix=0.5"
+    chain = _studio_chromakey_filter()
+    assert chain == (
+        "fps=30,scale=439:781,"
+        "chromakey=0x00FF00:0.12:0.15,"
+        "despill=type=green:mix=0.5,"
+        "format=yuva420p"
+    )
 
 
 def test_studio_green_mode_requires_bg(tmp_path):

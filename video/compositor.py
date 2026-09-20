@@ -34,15 +34,19 @@ STUDIO_AVATAR_WIDTH_PX = 439
 STUDIO_AVATAR_HEIGHT_PX = 781
 #: Centered: (1080 - 439) // 2. Keeps equal studio margins left/right.
 STUDIO_AVATAR_X_PX = 320
-#: Top offset tuned so the head sits upper-middle (studio + signage clear
-#: above) while the overlay bottom (560 + 781 = 1341) extends ~170px below
-#: the desk line (1171) and is occluded by the desk foreground.
-STUDIO_AVATAR_TOP_PX = 560
+#: Top offset: head at ~24.7% of 1920 (reference: presenter starts around
+#: 24-27%, seated behind the desk with shoulders + upper torso visible).
+#: Overlay bottom (475 + 781 = 1256) extends ~236px below the desk line
+#: (1020) and is occluded by the desk foreground. Source scan showed no
+#: stable hands/forearms (one transient gesture already clipped by the
+#: source frame edge), so geometry maximizes natural upper body instead.
+STUDIO_AVATAR_TOP_PX = 475
 #: Desk foreground: bottom strip of the canonical BG, fraction of 1920.
-#: 0.61 -> top y=1171, height=749. Matches the reference desk-surface line.
-STUDIO_DESK_TOP_FRAC = 0.61
-STUDIO_DESK_TOP_PX = 1171
-STUDIO_DESK_HEIGHT_PX = 749
+#: 0.53125 -> top y=1020 (~53%), height=900. Matches the reference
+#: tabletop line so the desk overlaps the lower presenter naturally.
+STUDIO_DESK_TOP_FRAC = 0.53125
+STUDIO_DESK_TOP_PX = 1020
+STUDIO_DESK_HEIGHT_PX = 900
 #: Feathered alpha gradient over the top rows of the desk strip so the
 #: presenter-to-desk transition never renders a hard rectangular edge.
 STUDIO_DESK_FEATHER_PX = 12
@@ -50,6 +54,10 @@ STUDIO_DESK_FEATHER_PX = 12
 STUDIO_CHROMAKEY_COLOR = "0x00FF00"
 STUDIO_CHROMAKEY_SIMILARITY = 0.12
 STUDIO_CHROMAKEY_BLEND = 0.15
+#: Green-spill cleanup applied immediately after chromakey (before
+#: format=yuva420p). Removes the fringe/halo on hair/skin edges without
+#: touching the key itself. None disables the stage.
+STUDIO_DESPILL = "despill=type=green:mix=0.5"
 
 #: Bound for the full final assembly render (single-shot, never retried).
 FFMPEG_TIMEOUT_S = 600
@@ -163,16 +171,19 @@ def _studio_chromakey_filter() -> str:
     """Keyed-presenter normalization for the green-screen studio path.
 
     Scales the HeyGen green-screen frame to the configured overlay size,
-    removes solid green, and emits yuva420p so the transparent surround
-    never renders a rectangular box over the studio.
+    removes solid green, cleans green spill on edges (despill), and emits
+    yuva420p so the transparent surround never renders a rectangular box
+    over the studio.
     """
-    return (
+    chain = (
         f"fps={FINAL_FPS},"
         f"scale={STUDIO_AVATAR_WIDTH_PX}:{STUDIO_AVATAR_HEIGHT_PX},"
         f"chromakey={STUDIO_CHROMAKEY_COLOR}:"
-        f"{STUDIO_CHROMAKEY_SIMILARITY}:{STUDIO_CHROMAKEY_BLEND},"
-        "format=yuva420p"
+        f"{STUDIO_CHROMAKEY_SIMILARITY}:{STUDIO_CHROMAKEY_BLEND}"
     )
+    if STUDIO_DESPILL:
+        chain += f",{STUDIO_DESPILL}"
+    return chain + ",format=yuva420p"
 
 
 def _studio_bg_filter() -> str:
