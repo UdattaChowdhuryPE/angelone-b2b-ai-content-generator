@@ -43,6 +43,10 @@ COPY assets/ ./assets/
 # `docker run -v ...:/data` working identically.
 RUN mkdir -p /data/output
 ENV OUTPUT_DIR=/data/output
+# Persistent job state: SQLite lives at the volume root (beside, never
+# inside, output/ so artifact cleanup can never delete it). Jobs survive
+# restarts/deployments; startup recovery marks stale processing jobs failed.
+ENV JOBSTORE_PATH=/data/jobstore.db
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8000

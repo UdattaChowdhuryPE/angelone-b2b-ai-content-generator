@@ -46,6 +46,28 @@ def _resolve_final_path(job: dict, output_root: str) -> str | None:
     return candidate
 
 
+#: Env var selecting the persistent job database. Production sets
+#: JOBSTORE_PATH=/data/jobstore.db (Railway persistent volume). When unset
+#: (local dev, tests) the process uses the in-memory JobStore — no stray
+#: database files are ever created implicitly.
+JOBSTORE_PATH_ENV = "JOBSTORE_PATH"
+
+
+def default_store() -> JobStore:
+    """Production store: SQLite on the persistent volume when configured.
+
+    Returns a SQLiteJobStore at $JOBSTORE_PATH, otherwise the in-memory
+    JobStore. Reopening the same path after a restart or redeploy restores
+    every job, so startup stale-job recovery actually works in production.
+    """
+    from backend.sqlite_store import SQLiteJobStore
+
+    path = os.getenv(JOBSTORE_PATH_ENV)
+    if path:
+        return SQLiteJobStore(path)  # type: ignore[return-value]
+    return JobStore()
+
+
 def create_app(
     store: JobStore | None = None,
     pipeline_factory=default_pipeline_factory,
@@ -55,7 +77,7 @@ def create_app(
     output_root: str | None = None,
 ) -> FastAPI:
     app = FastAPI(title="AI Financial Video Generator API")
-    app.state.store = store or JobStore()
+    app.state.store = store or default_store()
     app.state.pipeline_factory = pipeline_factory
     app.state.avatar_provider = avatar_provider
     app.state.broll_provider = broll_provider
