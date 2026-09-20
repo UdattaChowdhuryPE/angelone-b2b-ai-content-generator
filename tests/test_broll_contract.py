@@ -63,7 +63,10 @@ def _run_compose(tmp_path, board, broll):
         return _final_probe()
 
     def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
+        # Two-pass assembly issues one ffmpeg argv per pass; assertions
+        # read the concatenated argv so shape checks keep working.
+        captured.setdefault("cmds", []).append(list(cmd))
+        captured["cmd"] = [a for c in captured["cmds"] for a in c]
         with open(cmd[-1], "wb") as f:
             f.write(b"videobytes")
         return None

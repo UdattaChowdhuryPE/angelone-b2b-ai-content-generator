@@ -140,7 +140,10 @@ def _run_full_scene(tmp_path, board=None, broll=None, **kwargs):
         return _final_probe()
 
     def fake_run(cmd, **kw):
-        captured["cmd"] = cmd
+        # Two-pass assembly issues one ffmpeg argv per pass; assertions
+        # read the concatenated argv so shape checks keep working.
+        captured.setdefault("cmds", []).append(list(cmd))
+        captured["cmd"] = [a for c in captured["cmds"] for a in c]
         with open(cmd[-1], "wb") as f:
             f.write(b"videobytes")
         return None

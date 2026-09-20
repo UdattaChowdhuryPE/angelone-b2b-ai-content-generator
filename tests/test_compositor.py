@@ -74,7 +74,11 @@ def _run_compose(tmp_path, board, broll_files, avatar_audio=True):
         return _final_probe()
 
     def fake_run(cmd, **kwargs):
-        captured["cmd"] = cmd
+        # Two-pass assembly issues one ffmpeg argv per pass; assertions
+        # read the concatenated argv so single-pass shape checks keep
+        # working across both passes.
+        captured.setdefault("cmds", []).append(list(cmd))
+        captured["cmd"] = [a for c in captured["cmds"] for a in c]
         # Simulate ffmpeg writing the partial output (last arg).
         with open(cmd[-1], "wb") as f:
             f.write(b"videobytes")
@@ -138,6 +142,36 @@ def test_compose_cmd_shape_1080x1920_captions_faststart(tmp_path):
     segments = captured["segments"]
     assert segments[0]["start"] == 0.0
     assert segments[-1]["end"] == board.total_duration
+
+
+def test_compose_is_two_bounded_passes(tmp_path):
+    """Exit-9 guard: scene assembly and caption burn-in are separate
+    bounded ffmpeg passes (flat peak memory as caption count grows)."""
+    from video.compositor import FFMPEG_PRESET, FFMPEG_THREADS
+
+    broll_clip = tmp_path / "b.mp4"
+    broll_clip.write_bytes(b"broll")
+    board = _board_with_broll()
+    out, captured = _run_compose(tmp_path, board, {2: str(broll_clip)})
+    assert out.endswith("final.mp4")
+    cmds = captured["cmds"]
+    assert len(cmds) == 2  # pass 1 scenes, pass 2 captions
+    pass1 = " ".join(cmds[0])
+    pass2 = " ".join(cmds[1])
+    # Pass 1 carries scenes + concat but zero caption loops/overlays.
+    assert "concat" in pass1
+    assert "overlay=0:0:enable='between(t," not in pass1
+    assert "cap0" not in pass1
+    # Pass 2 carries the caption overlays against the assembled base.
+    assert "overlay=0:0:enable='between(t," in pass2
+    assert "concat" not in pass2
+    # Both passes are thread/preset-bounded; audio encoded once, copied.
+    for cmd in cmds:
+        joined = " ".join(cmd)
+        assert f"-preset {FFMPEG_PRESET}" in joined
+        assert "-threads" in cmd and str(FFMPEG_THREADS) in cmd
+    assert "-c:a copy" in pass2.split("-map")[-1] or "-c:a copy" in pass2
+    assert "+faststart" in pass2
 
 
 def test_compose_falls_back_to_voice_audio(tmp_path):

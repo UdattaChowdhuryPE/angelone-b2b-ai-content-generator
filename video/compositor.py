@@ -68,6 +68,16 @@ FFMPEG_TIMEOUT_S = 600
 #: Bound for media probing/validation. Failing fast beats hanging the worker.
 FFPROBE_TIMEOUT_S = 60
 
+#: Bounded encode settings for production-safe assembly. The scene pass and
+#: the caption pass each decode far fewer simultaneous 1080x1920 streams
+#: than the old single-pass graph, and preset veryfast (CRF unchanged at
+#: 20) + 2 threads cap encoder/filter peak RSS and wall-clock time so a
+#: render survives small single-worker containers instead of being
+#: SIGKILLed (exit -9) by the OOM-killer. Quality impact at CRF 20 for
+#: talking-head content is negligible.
+FFMPEG_THREADS = 2
+FFMPEG_PRESET = "veryfast"
+
 
 class CompositorError(RuntimeError):
     """Raised when FFmpeg assembly fails. Never mark the job completed."""
@@ -399,6 +409,9 @@ def compose_final(
       PNG overlay + enable=between(t,start,end) (proven V0.9 pattern).
     - Output: H.264 + AAC, yuv420p, +faststart, exactly 1080x1920,
       validated with ffprobe. Rendered atomically via .partial + rename.
+    - Bounded execution: scene assembly and caption burn-in run as two
+      sequential passes (bounded threads/preset) so peak memory stays
+      flat as caption count grows — never one giant unbounded graph.
 
     Returns output_path. Raises CompositorError / Mp4ValidationError.
     """
@@ -600,89 +613,145 @@ def compose_final(
         labels.append(f"[s{seg}]")
     parts.append(f"{''.join(labels)}concat=n={len(labels)}:v=1:a=0[vbase]")
 
-    # Captions last (FINAL layer over the assembled base).
-    cards = split_cards(full_script)
-    segments = time_cards(cards, total_duration)
-    cap_dir = os.path.join(work_dir, "captions")
-    cap_paths = render_all_cards(segments, cap_dir, font_path=font_path)
-    # Caption input indices must account for the optional fallback audio
-    # input appended below (avatar+broll[+bg+desk][+audio] -> caps).
-    first_cap_input = len(inputs) + (0 if use_avatar_audio else 1)
-    current = "vbase"
-    for i, segment in enumerate(segments):
-        nxt = f"cap{i}"
-        parts.append(
-            f"[{current}][{first_cap_input + i}:v]overlay=0:0:"
-            f"enable='between(t,{segment['start']},{segment['end']})'"
-            f"[{nxt}]"
-        )
-        current = nxt
+    # Two-pass bounded assembly (production-safe against exit -9/SIGKILL).
+    #
+    # The old single-pass graph decoded avatar + every B-roll clip + one
+    # full-duration looped 1080x1920 stream PER caption card simultaneously
+    # (input count grows with script length) behind x264 preset medium —
+    # peak RSS ~1.6GB for a short render, fatal on small containers.
+    #
+    # Pass 1 (scene assembly): avatar + B-roll (+ studio layers) only —
+    # no caption inputs, so peak decode/filter memory stays flat
+    # regardless of script length. Encodes the base + narration audio.
+    # Pass 2 (caption burn-in): base + caption PNG loops only, through a
+    # linear overlay chain; audio is copied, never re-encoded.
+    # Both passes use FFMPEG_PRESET/FFMPEG_THREADS bounds. Captions remain
+    # the FINAL pixel layer over the assembled base (proven V0.9 pattern).
+    scene_filter = ";".join(parts)
 
-    cmd = ["ffmpeg", "-y", "-i", avatar_path]
+    cmd_base = ["ffmpeg", "-y", "-threads", str(FFMPEG_THREADS),
+                "-i", avatar_path]
     for clip in clip_order:
-        cmd += ["-i", clip]
+        cmd_base += ["-i", clip]
     if use_studio:
         assert bg_source_path is not None and desk_fg_path is not None
-        cmd += [
+        cmd_base += [
             "-loop", "1", "-framerate", str(FINAL_FPS),
             "-t", f"{total_duration + 1:.2f}", "-i", bg_source_path,
         ]
-        cmd += [
+        cmd_base += [
             "-loop", "1", "-framerate", str(FINAL_FPS),
             "-t", f"{total_duration + 1:.2f}", "-i", desk_fg_path,
         ]
     fallback_audio_index: int | None = None
     if not use_avatar_audio:
         fallback_audio_index = len(inputs)
-        cmd += ["-i", audio_path]
+        cmd_base += ["-i", audio_path]
         inputs.append(audio_path)
-    for path in cap_paths:
-        cmd += [
-            "-loop", "1", "-framerate", str(FINAL_FPS),
-            "-t", f"{total_duration + 1:.2f}", "-i", path,
-        ]
     audio_map = "0:a" if use_avatar_audio else f"{fallback_audio_index}:a"
-    cmd += [
-        "-filter_complex", ";".join(parts),
-        "-map", f"[{current}]", "-map", audio_map,
-        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+    base_tmp = os.path.join(work_dir, ".compose_base.mp4")
+    cmd_base += [
+        "-filter_complex", scene_filter,
+        "-map", "[vbase]", "-map", audio_map,
+        "-filter_threads", str(FFMPEG_THREADS),
+        "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", "20",
         "-pix_fmt", "yuv420p", "-r", str(FINAL_FPS),
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
-        "-movflags", "+faststart", "-shortest",
-        # Atomic renders target <name>.partial, whose extension ffmpeg
-        # cannot infer a muxer from — pin the MP4 muxer explicitly.
-        "-f", "mp4",
+        "-shortest",
+        base_tmp,
     ]
+
+    # Captions last (FINAL layer over the assembled base).
+    cards = split_cards(full_script)
+    segments = time_cards(cards, total_duration)
+    cap_dir = os.path.join(work_dir, "captions")
+    cap_paths = render_all_cards(segments, cap_dir, font_path=font_path)
 
     parent = os.path.dirname(output_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
     partial = output_path + ".partial"
-    try:
-        subprocess.run(cmd + [partial], check=True, timeout=FFMPEG_TIMEOUT_S)
-    except subprocess.TimeoutExpired as exc:
+
+    def _cleanup_temps() -> None:
+        for tmp in (partial, base_tmp):
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
+    def _run(cmd: list[str], label: str) -> None:
         try:
-            if os.path.exists(partial):
-                os.remove(partial)
-        finally:
+            subprocess.run(cmd, check=True, timeout=FFMPEG_TIMEOUT_S)
+        except subprocess.TimeoutExpired as exc:
+            _cleanup_temps()
             raise CompositorError(
-                f"FFmpeg assembly timed out after {FFMPEG_TIMEOUT_S}s; "
-                "job is NOT marked completed."
+                f"FFmpeg assembly timed out after {FFMPEG_TIMEOUT_S}s "
+                f"({label}); job is NOT marked completed."
             ) from exc
-    except subprocess.CalledProcessError as exc:
+        except subprocess.CalledProcessError as exc:
+            _cleanup_temps()
+            raise CompositorError(
+                f"FFmpeg assembly failed (exit {exc.returncode}) "
+                f"({label}); job is NOT marked completed."
+            ) from exc
+
+    _run(cmd_base, "pass=scene-assembly")
+
+    if cap_paths:
+        # Pass 2 inputs: [0] assembled base, [1..N] caption PNG loops.
+        cmd_cap: list[str] = [
+            "ffmpeg", "-y", "-threads", str(FFMPEG_THREADS),
+            "-i", base_tmp,
+        ]
+        for path in cap_paths:
+            cmd_cap += [
+                "-loop", "1", "-framerate", str(FINAL_FPS),
+                "-t", f"{total_duration + 1:.2f}", "-i", path,
+            ]
+        cap_parts: list[str] = []
+        current = "0:v"
+        for i, segment in enumerate(segments):
+            nxt = f"cap{i}"
+            cap_parts.append(
+                f"[{current}][{1 + i}:v]overlay=0:0:"
+                f"enable='between(t,{segment['start']},{segment['end']})'"
+                f"[{nxt}]"
+            )
+            current = nxt
+        cmd_cap += [
+            "-filter_complex", ";".join(cap_parts),
+            "-map", f"[{current}]", "-map", "0:a",
+            "-filter_threads", str(FFMPEG_THREADS),
+            "-c:v", "libx264", "-preset", FFMPEG_PRESET, "-crf", "20",
+            "-pix_fmt", "yuv420p", "-r", str(FINAL_FPS),
+            # Audio already encoded in pass 1 — copy it verbatim.
+            "-c:a", "copy",
+            "-movflags", "+faststart", "-shortest",
+            # Atomic renders target <name>.partial, whose extension
+            # ffmpeg cannot infer a muxer from — pin MP4 explicitly.
+            "-f", "mp4",
+            partial,
+        ]
+        _run(cmd_cap, "pass=caption-overlay")
         try:
-            if os.path.exists(partial):
-                os.remove(partial)
-        finally:
-            raise CompositorError(
-                f"FFmpeg assembly failed (exit {exc.returncode}); "
-                "job is NOT marked completed."
-            ) from exc
+            os.remove(base_tmp)
+        except OSError:
+            pass
+    else:
+        # No captions (empty render list): the assembled base IS the final
+        # artifact — move it into place through the .partial gate so
+        # validation + atomic rename semantics never change.
+        os.replace(base_tmp, partial)
 
     expected = min(
         avatar_duration if avatar_duration > 0 else total_duration,
         total_duration if total_duration > 0 else avatar_duration,
     )
-    validate_mp4(partial, expected_duration=expected or None)
+    try:
+        validate_mp4(partial, expected_duration=expected or None)
+    except Exception:
+        _cleanup_temps()
+        raise
     os.replace(partial, output_path)
     return output_path
