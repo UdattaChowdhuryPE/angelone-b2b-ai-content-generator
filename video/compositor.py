@@ -16,9 +16,13 @@ FINAL_HEIGHT = 1920
 FINAL_FPS = 30
 
 #: ---------------------------------------------------------------------------
-#: Studio composition geometry (green-screen future-render path).
-#: ALL tunable numbers live here — never scatter magic numbers through the
-#: filter graph. Tuned against the deterministic local fixture to meet:
+#: Studio composition geometry (LEGACY green-screen path ONLY).
+#: These tunables belong exclusively to avatar_mode="green". The
+#: avatar_mode="full_scene" production path MUST NEVER read or execute
+#: any of them (no chromakey, no despill, no presenter scaling or
+#: positioning, no desk foreground, no background replacement).
+#: Values are frozen — existing green-screen tests pin them.
+#: ---------------------------------------------------------------------------
 #: centered presenter, 380-490px wide, head/shoulders upper-middle, studio
 #: branding visible above/beside, desk foreground from ~60-62% height with
 #: the lower presenter body fully occluded, no rectangular/halo artifacts.
@@ -364,8 +368,17 @@ def compose_final(
 ) -> str:
     """Assemble the complete final video: avatar + B-roll + captions.
 
-    Two avatar paths (legacy preserved byte-for-byte in filter shape):
+    Three avatar paths:
 
+    - full_scene (production default): the HeyGen render IS the
+      complete studio scene (presenter + background + desk + props).
+      The whole video is normalized to the final canvas via
+      _avatar_norm_filter() (proportional cover, no padding), B-roll
+      scenes play as full-frame cutaways, captions burn in last. This
+      path NEVER chromakeys, despills, uploads/composites any
+      background, scales or repositions the presenter, builds a desk
+      foreground, or reads any STUDIO_* geometry. Passing a
+      studio_background_path with full_scene is rejected loudly.
     - legacy (default when studio_background_path is None): per-scene
       segments show the HeyGen studio-BAKED avatar full-bleed via
       _avatar_norm_filter(); B-roll shows full-frame. Proven V0.7/V0.9
@@ -389,9 +402,16 @@ def compose_final(
 
     Returns output_path. Raises CompositorError / Mp4ValidationError.
     """
-    if avatar_mode not in ("auto", "green", "legacy"):
+    if avatar_mode not in ("auto", "green", "legacy", "full_scene"):
         raise CompositorError(
-            f"avatar_mode must be auto/green/legacy, got {avatar_mode!r}."
+            f"avatar_mode must be auto/green/legacy/full_scene, "
+            f"got {avatar_mode!r}."
+        )
+    if avatar_mode == "full_scene" and studio_background_path:
+        raise CompositorError(
+            "full_scene renders are already complete studio scenes — "
+            "a studio_background_path must never be composited over "
+            f"them (got {studio_background_path!r})."
         )
     if not avatar_path or not os.path.exists(avatar_path):
         raise CompositorError(f"Avatar video missing: {avatar_path}")
@@ -464,6 +484,13 @@ def compose_final(
         use_studio = True
     elif avatar_mode == "legacy":
         use_studio = False
+    elif avatar_mode == "full_scene":
+        # Production default: the avatar video is the complete scene.
+        # Whole-video cover normalization + B-roll cuts + captions only.
+        # This branch must never enable the studio (chromakey/presenter/
+        # desk) layers below — guarded by the rejection above and by
+        # never reading STUDIO_* geometry here.
+        use_studio = False
     else:  # auto: studio only when a real background file is passed.
         use_studio = bool(
             studio_background_path
@@ -473,8 +500,11 @@ def compose_final(
 
     norm = _norm_filter()
     avatar_norm = _avatar_norm_filter()
-    keyed_norm = _studio_chromakey_filter()
-    bg_norm = _studio_bg_filter()
+    # Green-screen filter chains are built ONLY for the studio path so
+    # the full_scene/legacy paths never even construct (let alone
+    # execute) chromakey/despill/presenter-geometry filters.
+    keyed_norm = _studio_chromakey_filter() if use_studio else ""
+    bg_norm = _studio_bg_filter() if use_studio else ""
     inputs = [avatar_path]
     clip_index: dict[str, int] = {}
     for clip in clip_order:

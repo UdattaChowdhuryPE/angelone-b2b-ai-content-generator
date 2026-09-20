@@ -62,11 +62,17 @@ def check_env() -> dict:
 def check_canonical_background(
     path: str = CANONICAL_BACKGROUND,
 ) -> dict:
+    # NOTE: the canonical background is a LEGACY-only dependency
+    # (avatar_mode="green"/studio-baked renders and rollback). The
+    # production default (avatar_mode="full_scene") never uploads or
+    # composites it, so run_preflight() does not gate readiness on it.
     if not os.path.exists(path):
         return _check(
             "canonical_background",
             FAIL,
-            f"missing canonical background: {path}",
+            f"missing canonical background: {path} "
+            "(legacy green/studio modes only; "
+            "not required for the full_scene production default)",
         )
     if os.path.getsize(path) == 0:
         return _check(
@@ -178,10 +184,15 @@ def check_production_wiring() -> dict:
 def check_provider_contracts() -> dict:
     problems = []
     try:
-        from providers.heygen import HeyGenAvatarProvider
+        from providers.heygen import (
+            FullSceneAvatarProvider,
+            HeyGenAvatarProvider,
+        )
 
         for method in (
             "generate",
+            "generate_full_scene",
+            "generate_green",
             "upload_audio",
             "upload_image",
             "create_video",
@@ -190,11 +201,21 @@ def check_provider_contracts() -> dict:
         ):
             if not hasattr(HeyGenAvatarProvider, method):
                 problems.append(f"HeyGenAvatarProvider.{method} missing")
+        if not issubclass(FullSceneAvatarProvider, HeyGenAvatarProvider):
+            problems.append(
+                "FullSceneAvatarProvider must subclass HeyGenAvatarProvider"
+            )
         sig = inspect.signature(HeyGenAvatarProvider.generate)
         for param in ("audio_path", "output_path"):
             if param not in sig.parameters:
                 problems.append(
                     f"HeyGenAvatarProvider.generate missing param {param}"
+                )
+        sig = inspect.signature(FullSceneAvatarProvider.generate)
+        for param in ("audio_path", "output_path"):
+            if param not in sig.parameters:
+                problems.append(
+                    f"FullSceneAvatarProvider.generate missing param {param}"
                 )
     except Exception as exc:
         problems.append(f"heygen import failed: {exc}")
@@ -222,6 +243,7 @@ def check_provider_contracts() -> dict:
             "broll",
             "storyboard",
             "output_path",
+            "avatar_mode",
         ):
             if param not in sig.parameters:
                 problems.append(
@@ -358,5 +380,13 @@ def run_preflight(output_root: str = "output") -> dict:
             "is a LIVE-ACCOUNT VERIFICATION item.",
         ),
     ]
-    ready = all(c["status"] != FAIL for c in checks)
+    ready = all(
+        c["status"] != FAIL
+        for c in checks
+        # canonical_background is a LEGACY-only dependency
+        # (avatar_mode="green"/studio-baked + rollback). The production
+        # default (avatar_mode="full_scene") never uploads or composites
+        # it, so its absence must not block readiness.
+        if c["name"] != "canonical_background"
+    )
     return {"ready": ready, "checks": checks}

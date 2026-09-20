@@ -99,9 +99,12 @@ def default_pipeline_factory():
 
 
 def default_avatar_provider():
-    from providers.heygen import HeyGenAvatarProvider
+    from providers.heygen import FullSceneAvatarProvider
 
-    return HeyGenAvatarProvider()
+    # Production default: complete-scene Photo Avatar (audio-only
+    # upload, no-background Avatar IV render). The configured
+    # HEYGEN_AVATAR_ID already contains presenter + studio + desk.
+    return FullSceneAvatarProvider()
 
 
 def default_broll_provider():
@@ -129,6 +132,11 @@ def default_compositor_fn(
         output_path=os.path.join(job_dir, FINAL_FILENAME),
         job_dir=job_dir,
         script_text=script_text,
+        # Production default: the HeyGen render IS the complete studio
+        # scene — normalize the whole video, B-roll cuts, captions.
+        # Never chromakey, never background replacement, never desk
+        # foreground (see compose_final avatar_mode="full_scene").
+        avatar_mode="full_scene",
     )
 
 

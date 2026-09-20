@@ -307,21 +307,27 @@ def test_controlled_request_matches_legacy_real_test():
     assert "Market volatility is normal" in req["key_message"]
 
 
-def test_worker_production_default_remains_legacy():
-    """Non-paid: worker defaults are untouched — legacy baked path default.
+def test_worker_production_default_is_full_scene():
+    """Non-paid: worker defaults wire the full_scene production path.
 
-    default_compositor_fn() must not pass any studio background (legacy
-    auto -> legacy path), and default_avatar_provider() must be the plain
-    HeyGenAvatarProvider whose generate() is the studio-baked render.
+    Architecture change (controlled Photo Avatar experiment): the
+    complete-scene Photo Avatar IS the studio, so the production
+    default must NOT upload/composite any background and must NOT
+    invoke green-screen generation. default_compositor_fn() passes
+    avatar_mode="full_scene" (never a studio background path, never
+    generate_green), and default_avatar_provider() is a
+    FullSceneAvatarProvider (a HeyGenAvatarProvider whose generate()
+    is the no-background full-scene render).
     """
     import backend.worker as worker_mod
-    from providers.heygen import HeyGenAvatarProvider
+    from providers.heygen import FullSceneAvatarProvider, HeyGenAvatarProvider
 
     src = inspect.getsource(worker_mod.default_compositor_fn)
+    assert 'avatar_mode="full_scene"' in src
     assert "studio_background_path" not in src
-    assert "avatar_mode" not in src
     assert "generate_green" not in src
     provider = worker_mod.default_avatar_provider()
+    assert isinstance(provider, FullSceneAvatarProvider)
     assert isinstance(provider, HeyGenAvatarProvider)
     assert not isinstance(provider, GreenScreenAvatarAdapter)
 

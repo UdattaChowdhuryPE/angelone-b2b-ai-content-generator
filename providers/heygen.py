@@ -111,6 +111,15 @@ class HeyGenAvatarProvider:
     GREEN_SCREEN_HEX = "#00FF00"
     GREEN_SCREEN_ENGINE = {"type": "avatar_iv"}
 
+    #: Production default avatar mode. "full_scene" means the configured
+    #: avatar (HEYGEN_AVATAR_ID) is a complete-scene Photo Avatar that
+    #: already contains presenter + studio + desk + props + lighting.
+    #: The generation payload carries NO background keys and the local
+    #: compositor must treat the render as an opaque, already-composited
+    #: scene (see video/compositor.py avatar_mode="full_scene").
+    #: Legacy modes ("studio", "green") are preserved for rollback.
+    DEFAULT_AVATAR_MODE = "full_scene"
+
     def __init__(
         self,
         api_key: str | None = None,
@@ -434,3 +443,76 @@ class HeyGenAvatarProvider:
                 f"HeyGen completed with no video_url: {final}"
             )
         return self.download_video(video_url, output_path)
+
+    def generate_full_scene(
+        self,
+        audio_path: str,
+        output_path: str,
+        poll_interval: int = 10,
+        timeout: int = 600,
+    ) -> str:
+        """Production-default avatar render: audio -> complete-scene MP4.
+
+        For complete-scene Photo Avatars (presenter + studio + desk +
+        props already in the uploaded avatar image). Uploads ONLY the
+        narration audio and creates the video with NO background keys —
+        no ``background``, no ``background_asset_id``, no
+        ``remove_background`` (Avatar IV, 9:16, 720p). HeyGen animates
+        the full scene as-is; the local compositor (avatar_mode=
+        "full_scene") normalizes the whole video without chromakey,
+        scaling, repositioning, or background replacement.
+        API errors propagate — never swallowed, never faked. The HeyGen
+        video_id and final status are printed (no secrets) so paid runs
+        leave an audit trail.
+        """
+        if not os.path.exists(audio_path):
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        parent = os.path.dirname(output_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        audio_asset_id = self.upload_audio(audio_path)
+        created = self.create_video(audio_asset_id)
+        video_id = created.get("data", {}).get("video_id")
+        if not video_id:
+            raise RuntimeError(
+                f"HeyGen create returned no video_id: {created}"
+            )
+        print(f"heygen full-scene render: video_id={video_id}")
+        final = self.wait_for_result(
+            video_id, poll_interval=poll_interval, timeout=timeout
+        )
+        print(
+            "heygen full-scene render: final status="
+            f"{final.get('data', {}).get('status')}"
+        )
+        data = final.get("data", {})
+        video_url = data.get("video_url") or data.get("url")
+        if not video_url:
+            raise RuntimeError(
+                f"HeyGen completed with no video_url: {final}"
+            )
+        return self.download_video(video_url, output_path)
+
+
+class FullSceneAvatarProvider(HeyGenAvatarProvider):
+    """Worker-compatible production default: complete-scene Photo Avatar.
+
+    Exposes the exact interface _run_downstream() requires (a .generate()
+    method taking audio + output paths) and delegates to
+    generate_full_scene() — audio-only upload, no-background Avatar IV
+    render, poll, download. The canonical studio background is never
+    uploaded and no matting/background-removal is requested. Legacy
+    studio-baked (generate) and green-screen (generate_green) behavior
+    is inherited unchanged for rollback.
+    """
+
+    def generate(
+        self,
+        audio_path: str,
+        output_path: str,
+        poll_interval: int = 10,
+        timeout: int = 600,
+    ) -> str:
+        return self.generate_full_scene(
+            audio_path, output_path, poll_interval, timeout
+        )
